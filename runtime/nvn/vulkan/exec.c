@@ -6055,6 +6055,31 @@ static uint64_t cs_content_key(uint64_t code_hash, const uint32_t local[3]) {
     return h;
 }
 
+// Scarlet / Violet: World detail (hle/npc_detail.c) for the models drawn in batches - trees, bushes, rocks. Those
+// pick their LOD and whether they're drawn at all on the GPU, in one compute pass (gpu_instancing_culling): per
+// instance, the distance to the camera (cb5[19]) minus its radius against the batch's draw distance and then its LOD
+// distances (per-batch records in memory). That distance, divided by the factor, moves every step that much farther:
+// the game's own record values stay. The pass is found by its translation (the one line computing that distance, in
+// a shader reading cb5[19]); the factor is read when it's translated - from the next start. LARECOMP_WORLD_DETAIL.
+static void world_detail_cs(ShaderInfo *si) {
+    extern int rt_sv_world_part(const char *part);
+    static const char pat[] = "r15 = as_u(((-as_f(r11)) + as_f(r4)));";
+    int f = rt_sv_world_part("INSTANCED");
+    char *at;
+    if (f <= 1 || !si || !si->msl || !strstr(si->msl, "cb5[19][0]") || !(at = strstr(si->msl, pat))) return;
+    char rep[96];
+    snprintf(rep, sizeof rep, "r15 = as_u(((-as_f(r11)) + as_f(r4)) * %.6ff);", 1.0 / f);
+    size_t n = strlen(si->msl), pl = strlen(pat), rl = strlen(rep), head = (size_t)(at - si->msl);
+    char *s = malloc(n - pl + rl + 1);
+    if (!s) return;
+    memcpy(s, si->msl, head);
+    memcpy(s + head, rep, rl);
+    memcpy(s + head + rl, at + pl, n - head - pl + 1);
+    free(si->msl);  // (maxwell_free frees the new one)
+    si->msl = s;
+    LOG("[world] instanced culling / LOD pass: distances x%d\n", f);
+}
+
 static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint64_t addr) {
     uint64_t wl, wn;
     gmem_window_get(&wl, &wn);
@@ -6064,6 +6089,7 @@ static bool translate_compute(CsProg *cp, const uint8_t *code, size_t max, uint6
     maxwell_gmem_base = gwin_base + wl, maxwell_gmem_size = wn;
     maxwell_gmem_chunk_shift = gmem_chunk_shift();
     cp->si = maxwell_translate(code, max, STAGE_COMPUTE, &k);
+    world_detail_cs(cp->si);
     if (ENV("LARECOMP_DUMP_GLSL")) {  // (debug) build/glsl/<code address>.comp
         mkdir("build/glsl", 0755);
         char path[96];

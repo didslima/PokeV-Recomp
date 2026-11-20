@@ -806,6 +806,26 @@ static void tab_display(bool in_game) {
                           "GPU onde há muitos. Muda na hora.")))
             g_settings.pokemon_detail = pv[pi];
     }
+    {   // every model's LOD distances (hle/npc_detail.c: the LOD factor; vulkan/exec.c world_detail_cs: instanced ones)
+        static const int wv[] = {1, 2, 3, 4};
+        const char *ws[] = {TR("Game's", "Do jogo"), "2x", "3x", "4x"};
+        int wi = 0;
+        for (int i = 0; i < 4; i++) if (wv[i] == g_settings.world_detail) wi = i;
+        if (opt_choice(TR("World detail", "Detalhe do mundo"), &wi, ws, 4, 0,
+                       TR("How far away the land, buildings, trees, bushes and rocks keep their detailed models: the "
+                          "land's detailed shape, far hills and cliffs drawn from their real pieces instead of their "
+                          "simplified stand-ins, and small things like rocks and bushes drawn farther. Higher: a "
+                          "sharper landscape into the distance, at CPU and GPU time (3x and 4x cost a lot of fps in "
+                          "towns) and more memory, which the game is given when it starts. A higher level applies "
+                          "from the next start; a lower one at once (trees, bushes and rocks from the next start).",
+                          "A que distância o terreno, prédios, árvores, arbustos e pedras mantêm os modelos detalhados: "
+                          "a forma detalhada do terreno, colinas e penhascos distantes desenhados com as peças reais em "
+                          "vez dos substitutos simplificados, e coisas pequenas como pedras e arbustos desenhadas mais "
+                          "longe. Maior: uma paisagem nítida ao longe, por tempo da CPU e da GPU (3x e 4x custam muitos "
+                          "fps em cidades) e mais memória, que o jogo recebe ao iniciar. Um nível maior vale a partir do "
+                          "próximo início; um menor, na hora (árvores, arbustos e pedras a partir do próximo início).")))
+            g_settings.world_detail = wv[wi];
+    }
 #ifndef __APPLE__
     if (!la) {  // (runtime/nvn/vulkan/exec.c fsr2_copy: applies at once)
         int t = g_settings.taa >= TAA_GAME && g_settings.taa <= TAA_DLAA ? g_settings.taa : TAA_GAME;

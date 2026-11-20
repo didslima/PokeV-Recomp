@@ -177,15 +177,20 @@ static void region_remove(uint64_t addr) {
 // from afar (manager +0xc58, f_70010358c8) is lowered as its headroom over 200 MB shrinks below ~108 MB, never raised.
 // With 64 shown a big city's models took it to ~2.68 of its 2.98 GB - past that line. Reported as application memory
 // + 2 x EXTRA with EXTRA counted as used: programSize, the GlobalHeap and the free memory mapped for it all grow by
-// EXTRA, whichever the game asks first. LARECOMP_EXTRA_MEMORY_MB=<n> overrides (0: none, at most 512). HEAP_MAX
-// (rt.h) leaves room for it.
+// EXTRA, whichever the game asks first. With World detail past 1x, 352 MB more on top (hle/heaps.c gives the game's
+// small-object allocator up to 360 MB more out of it): the free memory the game maps as one pool - the guest memory
+// window shaders see as one storage buffer (3733 MB with 512) - then comes to 4085 MB, just under the 4 GB a storage
+// buffer can span. LARECOMP_EXTRA_MEMORY_MB=<n> overrides (0: none, at most 864). HEAP_MAX (rt.h) leaves room for it.
 static uint64_t extra_memory(void) {
     static int64_t v = -1;
     if (v < 0) {
+        extern int rt_sv_world_detail_boot(void);
         const char *e = getenv("LARECOMP_EXTRA_MEMORY_MB");
-        v = e ? (int64_t)atoll(e) << 20 : g_settings.npc_shown > 12 ? 512ll << 20 : 0;
-        if (v < 0 || v > (512ll << 20)) v = v < 0 ? 0 : 512ll << 20;
-        if (v) LOG("[kernel] %lld MB more memory for the game (people shown)\n", (long long)(v >> 20));
+        bool people = g_settings.npc_shown > 12, world = rt_sv_world_detail_boot() > 1;
+        v = e ? (int64_t)atoll(e) << 20 : ((people ? 512ll : 0) + (world ? 352ll : 0)) << 20;
+        if (v < 0 || v > (864ll << 20)) v = v < 0 ? 0 : 864ll << 20;
+        if (v) LOG("[kernel] %lld MB more memory for the game (%s)\n", (long long)(v >> 20),
+                   e ? "LARECOMP_EXTRA_MEMORY_MB" : people && world ? "people shown, World detail" : people ? "people shown" : "World detail");
     }
     return (uint64_t)v;
 }

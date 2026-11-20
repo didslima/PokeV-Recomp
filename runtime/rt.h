@@ -54,7 +54,7 @@ static inline void __attribute__((format(printf, 1, 2))) rt_log(const char *fmt,
 #define ALIAS_SIZE   0x0C00000000ull   // 48 GB, up to GUEST_HI (16 GB fit Z-A; Arceus reserves 32 GB in one piece)
 #endif
 #define HEAP_BASE    0x7240000000ull
-#define HEAP_MAX     0x00F0000000ull   // 3.75 GB (3.25 + kernel.c extra_memory for Scarlet / Violet's people shown)
+#define HEAP_MAX     0x00FF800000ull   // 4088 MB (3.25 GB + kernel.c extra_memory for Scarlet / Violet: under 4 GB)
 
 // ---- the game (kernel.c; set from exefs/main.npdm by main.c)
 extern uint64_t g_program_id;  // GetInfo 18, Link's Awakening's by default

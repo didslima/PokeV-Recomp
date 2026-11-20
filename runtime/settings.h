@@ -72,6 +72,7 @@ typedef struct {
     int ssgi_strength;   // its strength, percent (50-300; 100 one physical bounce)
     bool water_ssr;      // water reflections (vulkan/exec.c water_apply)
     int npc_shown;       // Scarlet / Violet: town people shown at once; 0 the game's (12) (hle/npc_shown.c)
+    int world_detail;    // Scarlet / Violet: every model's LOD distances times this; 0/1 the game's (hle/npc_detail.c)
     int npc_detail;      // Scarlet / Violet: town people's model detail distances times this; 0/1 the game's (hle/npc_detail.c)
     int pokemon_detail;  // Scarlet / Violet: Pokémon's model detail distances times this; 0/1 the game's (hle/npc_detail.c)
     bool tex_hd, tex_dump;  // HD texture packs (textures/hd) on; dump the game's textures (textures/dump): vulkan/textures.c
