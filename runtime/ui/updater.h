@@ -71,8 +71,9 @@ struct UpdaterParseResult {
     std::string sha256sums_url;
 };
 
-// Parse GitHub /releases/latest object (or /releases array), ignoring draft and prerelease entries.
+// Parse GitHub /releases/latest object (or /releases array), ignoring draft entries and (by default) prereleases.
 UpdaterParseResult updater_parse_release_json(const std::string &json);
+UpdaterParseResult updater_parse_release_json_opts(const std::string &json, bool include_prerelease);
 
 // Parse SHA256SUMS content and return lowercase 64-hex sha256 for `filename`, or "" if missing/invalid.
 std::string updater_parse_sha256sums(const std::string &sums_text, const std::string &filename);

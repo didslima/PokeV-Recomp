@@ -30,6 +30,8 @@ namespace fs = std::filesystem;
 
 static const char *GITHUB_LATEST_URL =
     "https://api.github.com/repos/didslima/PokeV-Recomp/releases/latest";
+static const char *GITHUB_RELEASES_URL =
+    "https://api.github.com/repos/didslima/PokeV-Recomp/releases?per_page=10";
 static const char *GITHUB_RELEASES_WEB =
     "https://github.com/didslima/PokeV-Recomp/releases";
 static const char *LINUX_ASSET_NAME = "PokeV-Recomp-linux-x86_64.AppImage";
@@ -58,16 +60,29 @@ long long updater_tag_rank(const std::string &tag) {
     int n = 0;
     char end = 0;
     if (sscanf(tag.c_str(), "beta_%d%c", &n, &end) == 1 && n >= 0)
-        return -1000000LL + n;
+        return -10000000000LL + n;
 
     const char *p = tag.c_str();
     if (*p == 'v' || *p == 'V') p++;
     int maj = 0, min = 0, pat = 0;
-    if (sscanf(p, "%d.%d.%d%c", &maj, &min, &pat, &end) == 3 &&
-        maj >= 0 && min >= 0 && min < 1000 && pat >= 0 && pat < 1000) {
-        return (long long)maj * 1000000LL + (long long)min * 1000LL + pat;
+    int off = 0;
+    if (sscanf(p, "%d.%d.%d%n", &maj, &min, &pat, &off) != 3 ||
+        maj < 0 || min < 0 || min >= 1000 || pat < 0 || pat >= 1000) {
+        return -20000000000LL;
     }
-    return -2000000LL;
+    long long base = ((long long)maj * 1000000LL + (long long)min * 1000LL + pat) * 10000LL;
+    const char *suf = p + off;
+    if (*suf == '\0') return base;
+
+    int pre_n = 0;
+    if (sscanf(suf, "-rc.%d%c", &pre_n, &end) == 1 && pre_n >= 1 && pre_n < 1000)
+        return base - 1000LL + pre_n;
+    if (sscanf(suf, "-beta.%d%c", &pre_n, &end) == 1 && pre_n >= 1 && pre_n < 1000)
+        return base - 2000LL + pre_n;
+    if (sscanf(suf, "-alpha.%d%c", &pre_n, &end) == 1 && pre_n >= 1 && pre_n < 1000)
+        return base - 3000LL + pre_n;
+
+    return -20000000000LL;
 }
 
 std::string updater_tag_label(const std::string &tag, bool with_word) {
@@ -365,15 +380,18 @@ static std::string sanitize_release_url(const std::string &url, const std::strin
     return GITHUB_RELEASES_WEB;
 }
 
-UpdaterParseResult updater_parse_release_json(const std::string &json) {
+UpdaterParseResult updater_parse_release_json_opts(const std::string &json, bool include_prerelease) {
     UpdaterParseResult res;
     size_t pos = skip_ws(json, 0);
     if (pos >= json.size()) return res;
 
     auto accept_candidate = [&](const ParsedObj &o) {
-        if (!o.valid || o.is_draft || o.is_prerelease) return;
+        if (!o.valid || o.is_draft) return;
+        if (!include_prerelease) {
+            if (o.is_prerelease || o.tag_name.find('-') != std::string::npos) return;
+        }
         long long r = updater_tag_rank(o.tag_name);
-        if (r <= -2000000LL) return;
+        if (r <= -20000000000LL) return;
         if (!res.found_stable || r > updater_tag_rank(res.tag_name)) {
             res.found_stable = true;
             res.tag_name = o.tag_name;
@@ -415,6 +433,10 @@ UpdaterParseResult updater_parse_release_json(const std::string &json) {
     }
 
     return res;
+}
+
+UpdaterParseResult updater_parse_release_json(const std::string &json) {
+    return updater_parse_release_json_opts(json, false);
 }
 
 std::string updater_parse_sha256sums(const std::string &sums_text, const std::string &filename) {
@@ -807,6 +829,8 @@ static void *check_thread(void *) {
     int http_code = 200;
     bool network_ok = true;
     std::string err_detail;
+    const char *pre_env = getenv("LARECOMP_UPDATE_PRERELEASE");
+    bool include_prerelease = (pre_env && strcmp(pre_env, "1") == 0);
 
     if (const char *sim_code = getenv("LARECOMP_UPDATE_HTTP_STATUS")) {
         http_code = atoi(sim_code);
@@ -831,7 +855,8 @@ static void *check_thread(void *) {
             std::string ua = "PokeV-Recomp/" + (cur_ver.empty() ? std::string("unknown") : cur_ver);
 
             bool cancelled = false;
-            if (!run_curl_to_file(curl, ua, GITHUB_LATEST_URL, body_path, status_path, 15,
+            const char *api_url = include_prerelease ? GITHUB_RELEASES_URL : GITHUB_LATEST_URL;
+            if (!run_curl_to_file(curl, ua, api_url, body_path, status_path, 15,
                                   NULL, http_code, cancelled, err_detail)) {
                 network_ok = false;
             } else {
@@ -866,7 +891,7 @@ static void *check_thread(void *) {
         return NULL;
     }
 
-    UpdaterParseResult parsed = updater_parse_release_json(body);
+    UpdaterParseResult parsed = updater_parse_release_json_opts(body, include_prerelease);
     if (!parsed.ok) {
         set_check_result(UPD_CHK_HTTP_ERROR, "", GITHUB_RELEASES_WEB, "", "", 0, "",
                          "Invalid response from GitHub Releases API.");

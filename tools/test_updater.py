@@ -117,17 +117,25 @@ int main() {
     assert(tmp_dir_c && expected_hello_sha);
     std::string tmp_dir = tmp_dir_c;
 
-    // 1. Version comparison (Phase A)
+    // 1. Version comparison (Phase A + RC ordering)
     assert(updater_tag_rank("beta_2") < updater_tag_rank("v0.0.1"));
     assert(updater_tag_rank("v0.0.30") < updater_tag_rank("v0.1.0"));
-    assert(updater_tag_rank("v0.1.0") < updater_tag_rank("v0.1.1"));
+    assert(updater_tag_rank("v0.1.0") < updater_tag_rank("v0.1.1-alpha.1"));
+    assert(updater_tag_rank("v0.1.1-alpha.1") < updater_tag_rank("v0.1.1-beta.1"));
+    assert(updater_tag_rank("v0.1.1-beta.1") < updater_tag_rank("v0.1.1-rc.1"));
+    assert(updater_tag_rank("v0.1.1-rc.1") < updater_tag_rank("v0.1.1-rc.2"));
+    assert(updater_tag_rank("v0.1.1-rc.2") < updater_tag_rank("v0.1.1-rc.10"));
+    assert(updater_tag_rank("v0.1.1-rc.10") < updater_tag_rank("v0.1.1"));
     assert(updater_tag_rank("v0.1.1") < updater_tag_rank("v0.2.0"));
     assert(updater_tag_rank("v0.2.0") < updater_tag_rank("v1.0.0"));
-    assert(updater_tag_rank("v0.2.0-rc1") <= -2000000LL);
-    assert(updater_tag_rank("nightly") <= -2000000LL);
+    assert(updater_tag_rank("v0.1.1-rc.0") <= -20000000000LL);
+    assert(updater_tag_rank("v0.1.1-rc.abc") <= -20000000000LL);
+    assert(updater_tag_rank("v0.1.1-foo") <= -20000000000LL);
+    assert(updater_tag_rank("nightly") <= -20000000000LL);
     assert(updater_tag_label("v0.1.0", false) == "0.1.0");
+    assert(updater_tag_label("v0.1.1-rc.1", false) == "0.1.1-rc.1");
     assert(updater_tag_label("v0.1.0", true) == "Version 0.1.0");
-    printf("ok   version comparison\n");
+    printf("ok   version comparison (stable & RC)\n");
 
     // 2. Auto-check suppression BEFORE any manual check runs (Phase A)
     set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
@@ -182,6 +190,37 @@ int main() {
         R"({"tag_name":"v9.9.9","draft":true,"prerelease":false})");
     assert(r_draft.ok && !r_draft.found_stable);
     printf("ok   null fields, truncated json & stable filtering\n");
+
+    // 4b. Stable channel vs opt-in LARECOMP_UPDATE_PRERELEASE=1
+    const char *rc_array_json = R"([
+      {"tag_name":"v0.1.2-rc.1","draft":true,"prerelease":true,"html_url":"https://github.com/x/d"},
+      {"tag_name":"v0.1.1-rc.1","draft":false,"prerelease":true,"html_url":"https://github.com/x/rc1","body":"RC 1",
+       "assets":[{"name":"PokeV-Recomp-linux-x86_64.AppImage","size":11,"browser_download_url":"https://github.com/x/rc1.AppImage"},
+                 {"name":"SHA256SUMS","size":100,"browser_download_url":"https://github.com/x/SHA256SUMS"}]},
+      {"tag_name":"v0.1.0","draft":false,"prerelease":false,"html_url":"https://github.com/x/010","body":"Stable"}
+    ])";
+    // Default (stable channel): must select v0.1.0 and NOT expose v0.1.1-rc.1
+    UpdaterParseResult r_stable_only = updater_parse_release_json_opts(rc_array_json, false);
+    assert(r_stable_only.ok && r_stable_only.found_stable && r_stable_only.tag_name == "v0.1.0");
+    // Opt-in prerelease channel: must ignore draft v0.1.2-rc.1 and select v0.1.1-rc.1
+    UpdaterParseResult r_rc_optin = updater_parse_release_json_opts(rc_array_json, true);
+    assert(r_rc_optin.ok && r_rc_optin.found_stable && r_rc_optin.tag_name == "v0.1.1-rc.1");
+    assert(r_rc_optin.linux_asset_url == "https://github.com/x/rc1.AppImage");
+
+    set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
+    set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
+    set_env("LARECOMP_UPDATE_JSON", rc_array_json);
+    set_env("LARECOMP_UPDATE_PRERELEASE", nullptr);
+    updater_configure("v0.1.0", "", false, false);
+    updater_start_check(true);
+    assert(wait_check_done().state == UPD_CHK_UP_TO_DATE);  // regular user stays on v0.1.0
+
+    set_env("LARECOMP_UPDATE_PRERELEASE", "1");
+    updater_start_check(true);
+    UpdaterSnapshot s_rc = wait_check_done();
+    assert(s_rc.state == UPD_CHK_AVAILABLE && s_rc.latest_tag == "v0.1.1-rc.1");
+    set_env("LARECOMP_UPDATE_PRERELEASE", nullptr);
+    printf("ok   stable channel isolation & LARECOMP_UPDATE_PRERELEASE=1 opt-in\n");
 
     // 5. Async checker states & errors (Phase A)
     set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
