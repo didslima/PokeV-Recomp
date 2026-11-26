@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -78,6 +79,7 @@ static UpdaterSnapshot wait_check_done() {
     return updater_get_snapshot();
 }
 
+#ifdef __linux__
 static UpdaterSnapshot wait_install_done() {
     for (int i = 0; i < 400; i++) {
         UpdaterSnapshot s = updater_get_snapshot();
@@ -87,6 +89,7 @@ static UpdaterSnapshot wait_install_done() {
     assert(false && "updater_start_install timed out");
     return updater_get_snapshot();
 }
+#endif
 
 static void write_bytes(const std::string &path, const std::string &data) {
     FILE *f = fopen(path.c_str(), "wb");
@@ -95,6 +98,7 @@ static void write_bytes(const std::string &path, const std::string &data) {
     fclose(f);
 }
 
+#ifdef __linux__
 static std::string read_bytes(const std::string &path) {
     FILE *f = fopen(path.c_str(), "rb");
     assert(f);
@@ -105,6 +109,7 @@ static std::string read_bytes(const std::string &path) {
     fclose(f);
     return out;
 }
+#endif
 
 int main() {
     const char *tmp_dir_c = getenv("LARECOMP_TEST_TMPDIR");
@@ -209,7 +214,7 @@ int main() {
     assert(updater_file_sha256(hello_file) == expected_hello_sha);
     printf("ok   sha256sums parsing & file_sha256\n");
 
-#ifndef _WIN32
+#ifdef __linux__
     // 7. Install kind detection, paths with spaces & special chars, read-only dir (Phase B)
     set_env("APPIMAGE", nullptr);
     set_env("LARECOMP_DATA_ROOT", nullptr);
@@ -353,7 +358,7 @@ int main() {
 
 def test_external_helper_e2e():
     """End-to-end test of the external /bin/sh helper: waits for PID, swaps staged -> target, relaunches."""
-    if os.name == "nt":
+    if not sys.platform.startswith("linux"):
         return
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(tmp) / "Dir With Spaces & 'Quotes'"
