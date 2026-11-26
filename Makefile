@@ -52,8 +52,9 @@ RT_SRC   := $(wildcard runtime/*.c runtime/*.cpp) $(wildcard runtime/hle/*.c) $(
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
 RT_HDRS  := $(wildcard runtime/*.h runtime/game_addresses/*.h) $(wildcard runtime/platform/*.h) $(wildcard runtime/nvn/*.h) \
             $(wildcard runtime/nvn/maxwell/*.h) $(wildcard runtime/nvn/vulkan/*.h) $(wildcard runtime/ui/*.h)
-UI_SRC   := $(wildcard runtime/ui/*.mm)
-UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(UI_SRC))
+UI_SRC   := $(wildcard runtime/ui/*.mm) $(wildcard runtime/ui/*.cpp)
+UI_OBJ   := $(patsubst runtime/%.mm,$(B)/rt/%.o,$(wildcard runtime/ui/*.mm)) \
+            $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(wildcard runtime/ui/*.cpp))
 IMGUI_OBJ := $(B)/imgui/imgui.o $(B)/imgui/imgui_draw.o $(B)/imgui/imgui_tables.o $(B)/imgui/imgui_widgets.o \
              $(B)/imgui/imgui_impl_sdl3.o
 
@@ -231,6 +232,10 @@ $(GAMELIB): $(GEN_OBJ) | $(EXE)
 $(B)/rt/ui/%.o: runtime/ui/%.mm $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(UIFLAGS) -c $< -o $@
+
+$(B)/rt/ui/%.o: runtime/ui/%.cpp $(RT_HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(B)/imgui/%.o: $(IMGUI)/%.cpp
 	@mkdir -p $(dir $@)

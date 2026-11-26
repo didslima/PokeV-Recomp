@@ -26,6 +26,7 @@
 #include "option_rows.h"
 #include "osk.h"
 #include "pad_nav.h"
+#include "updater.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -112,17 +113,7 @@ static void lang_update(void) { g_pt = settings_ui_portuguese(); }  // (runtime/
 // number; other tags are ignored. Offline / no curl / anything unexpected: nothing is shown.
 // (PokeV-Recomp's own releases: until v0.0.15 this asked ZA Recomp's, so the start screen offered another project's
 // versions as updates)
-#define RELEASES_URL "https://api.github.com/repos/didslima/PokeV-Recomp/releases?per_page=100"
 #define RELEASE_PAGE "https://github.com/didslima/PokeV-Recomp/releases/tag/"
-
-static long long tag_rank(const std::string &t) {
-    int n, a, b, c;
-    char end;
-    if (sscanf(t.c_str(), "beta_%d%c", &n, &end) == 1 && n > 0) return n;
-    if (sscanf(t.c_str(), "v%d.%d.%d%c", &a, &b, &c, &end) == 3 && a >= 0 && b >= 0 && c >= 0 && b < 4096 && c < 4096)
-        return (1LL << 48) + ((long long)a << 24) + ((long long)b << 12) + c;
-    return -1;
-}
 
 // "Beta 2" / "1.0.0" (with_word: "Version 1.0.0")
 static std::string tag_label(const std::string &t, bool with_word) {
@@ -138,73 +129,6 @@ static std::string g_update_url;  // its Windows zip (browser_download_url: the 
 static long long g_update_size;
 static pthread_mutex_t g_update_lock = PTHREAD_MUTEX_INITIALIZER;
 #define UPDATE_ASSET "PokeV-Recomp-windows-x64.zip"
-
-static void *update_thread(void *) {
-    return NULL;  // Standalone release: external Z-A update checks disabled
-    std::string body;
-    if (const char *t = getenv("LARECOMP_UPDATE_TAGS")) {  // (test) "beta_2,v1.0.0": these releases, no network
-        for (const char *p = t; *p;) {
-            const char *c = strchr(p, ',');
-            body += "\"tag_name\": \"" + std::string(p, c ? c - p : strlen(p)) + "\"\n";
-            p = c ? c + 1 : p + strlen(p);
-        }
-    } else {
-#ifdef _WIN32
-        const char *sr = getenv("SystemRoot");
-        std::string curl = std::string(sr ? sr : "C:\\Windows") + "\\System32\\curl.exe";
-#else
-        std::string curl = "/usr/bin/curl";
-#endif
-        std::string out = std::string(rt_data_root()) + "/cache/releases.json";
-        mkdir((std::string(rt_data_root()) + "/cache").c_str(), 0755);
-        const char *av[] = {curl.c_str(), "-fsSL", "--max-time", "15", "-H", "Accept: application/vnd.github+json",
-                            "-A", "PokeV-Recomp/" LARECOMP_VERSION, RELEASES_URL, NULL};
-        PlatProc p = plat_spawn(av, out.c_str(), false);
-        if (!p || plat_proc_wait(p, true) != 0) { remove(out.c_str()); return NULL; }
-        if (FILE *f = fopen(out.c_str(), "rb")) {
-            char buf[8192];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof buf, f)) > 0 && body.size() < (8u << 20)) body.append(buf, n);
-            fclose(f);
-        }
-        remove(out.c_str());
-    }
-    std::string best, url;
-    long long best_rank = tag_rank(LARECOMP_VERSION), size = 0;
-    for (size_t at = 0; (at = body.find("\"tag_name\"", at)) != std::string::npos;) {
-        size_t q1 = body.find('"', body.find(':', at) + 1), q2 = q1 == std::string::npos ? q1 : body.find('"', q1 + 1);
-        if (q2 == std::string::npos) break;
-        std::string tag = body.substr(q1 + 1, q2 - q1 - 1);
-        if (tag_rank(tag) > best_rank) {
-            best_rank = tag_rank(tag), best = tag, url.clear(), size = 0;
-            // its assets follow the tag in GitHub's release object, up to the next release's tag
-            size_t end = body.find("\"tag_name\"", q2), u = q2;
-            while ((u = body.find("\"browser_download_url\"", u)) != std::string::npos && u < end) {
-                size_t a = body.find('"', body.find(':', u) + 1), b = a == std::string::npos ? a : body.find('"', a + 1);
-                if (b == std::string::npos) break;
-                std::string link = body.substr(a + 1, b - a - 1);
-                if (link.size() > strlen(UPDATE_ASSET) && link.compare(link.size() - strlen(UPDATE_ASSET), std::string::npos, UPDATE_ASSET) == 0) {
-                    url = link;
-                    size_t sz = body.rfind("\"size\"", u);  // (the asset's own size comes before its link)
-                    if (sz != std::string::npos && sz > q2) size = atoll(body.c_str() + body.find(':', sz) + 1);
-                    break;
-                }
-                u = b;
-            }
-        }
-        at = q2;
-    }
-    if (const char *z = getenv("LARECOMP_UPDATE_ZIP"))  // (test) install this zip: a local file or a link
-        url = strncmp(z, "http", 4) ? std::string("file:") + z : std::string(z), size = getenv("LARECOMP_UPDATE_SIZE") ? atoll(getenv("LARECOMP_UPDATE_SIZE")) : 0;
-    if (!best.empty()) fprintf(stderr, "[launcher] update available: %s (this build %s)%s\n", best.c_str(), LARECOMP_VERSION,
-                               url.empty() ? "" : ", installable from the start screen");
-    pthread_mutex_lock(&g_update_lock);
-    g_update_tag = best;
-    g_update_url = url;
-    g_update_size = size;
-    pthread_mutex_unlock(&g_update_lock);
-    return NULL;
-}
 
 // ------------------------------------------------------------------ updater (Windows, #75)
 // "Update now" on the start screen: the release's zip from GitHub (its own download link - counted there like a click,
@@ -2291,12 +2215,12 @@ extern "C" void launcher_run(const char *root) {
     settings_load();
     lang_update();
     static bool update_checked;  // (once per launch, not again after a "Title screen" reboot)
-    const char *rl = getenv("RECOMPLAUNCHER");
-    if (!update_checked && !getenv("LARECOMP_NO_UPDATE_CHECK") && !(rl && !strcmp(rl, "1"))) {
+    if (!update_checked) {
         update_checked = true;
-        pthread_t t;
-        if (pthread_create(&t, NULL, update_thread, NULL) == 0) pthread_detach(t);
+        updater_configure(LARECOMP_VERSION, rt_data_root(), false, false);
+        updater_start_check(false);
 #ifdef _WIN32
+        pthread_t t;
         if (pthread_create(&t, NULL, upd_cleanup, NULL) == 0) pthread_detach(t);
 #endif
     }
@@ -2496,7 +2420,7 @@ extern "C" void launcher_run(const char *root) {
                 continue;
             }
             if (!launcher_pad_event(e)) ImGui_ImplSDL3_ProcessEvent(&e);
-            if (e.type == SDL_EVENT_QUIT) exit(0);
+            if (e.type == SDL_EVENT_QUIT) { updater_shutdown(); exit(0); }
         }
         // setup finished: check again
         static bool was_busy;
@@ -3209,67 +3133,104 @@ extern "C" void launcher_run(const char *root) {
                 pthread_mutex_lock(&g_update_lock);
                 std::string updated = g_updated_tag;
                 pthread_mutex_unlock(&g_update_lock);
-                if (!updated.empty() && upd.empty() && ust == UPD_IDLE) {  // (just updated: said for this run)
+                float right_x = W_ - 28;
+                UpdaterSnapshot us = updater_get_snapshot();
+                if (!(us.suppressed_by_launcher && !us.has_checked) && ust == UPD_IDLE) {
+                    std::string link;
+                    ImU32 col = C_MUTED;
+                    ImU32 col_hi = C_TEXT;
+                    bool open_notes_modal = false;
+                    bool retry_click = false;
+
+                    if (us.state == UPD_CHK_CHECKING) {
+                        link = TR("Checking for updates...", "Verificando atualizações...");
+                    } else if (us.state == UPD_CHK_AVAILABLE) {
+                        link = std::string(TR("New version ", "Nova versão ")) +
+                               updater_tag_label(us.latest_tag, false) +
+                               TR(" available — release notes", " disponível — ver notas");
+                        col = C_GOLD;
+                        col_hi = C_GOLD_HI;
+                        open_notes_modal = true;
+                    } else if (us.state == UPD_CHK_UP_TO_DATE) {
+                        link = TR("Up to date — Check for updates", "Atualizado — Verificar atualizações");
+                        open_notes_modal = true;
+                    } else if (us.state == UPD_CHK_RATE_LIMITED) {
+                        link = TR("Update check rate-limited — Retry", "Limite da API atingido — Tentar de novo");
+                        retry_click = true;
+                    } else if (us.state == UPD_CHK_OFFLINE || us.state == UPD_CHK_HTTP_ERROR) {
+                        link = TR("Update check offline/failed — Retry", "Sem conexão / erro — Tentar de novo");
+                        retry_click = true;
+                    } else if (!us.suppressed_by_launcher) {
+                        link = TR("Check for updates", "Verificar atualizações");
+                        retry_click = true;
+                    }
+
+                    if (!link.empty()) {
+                        ImVec2 ls = text_size(F_LABEL, 14, link.c_str());
+                        float lx2 = right_x - ls.x, ly2 = H_ - 24 - ls.y / 2;
+                        ImGui::SetCursorScreenPos(P(lx2, ly2));
+                        bool click = ui_invisible_button("##update", S(ls.x, ls.y), ImGuiButtonFlags_EnableNav);
+                        bool hover = item_hot();
+                        text(dl, F_LABEL, 14, lx2, ly2, hover ? col_hi : col, link.c_str());
+                        if (hover) {
+                            dl->AddLine(P(lx2, ly2 + ls.y), P(lx2 + ls.x, ly2 + ls.y), col_hi, 1.2f * g_s);
+                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                        }
+                        if (click) {
+                            if (retry_click) updater_start_check(true);
+                            else if (open_notes_modal) ImGui::OpenPopup("##updnotes");
+                        }
+                        right_x = lx2 - 24;
+                    }
+                }
+                if (!updated.empty() && upd.empty() && ust == UPD_IDLE) {  // (just updated: left of checker status)
                     std::string m = std::string(TR("Updated to version ", "Atualizado para a versão ")) + tag_label(updated, false);
                     ImVec2 ms = text_size(F_LABEL, 14, m.c_str());
-                    float mx = W_ - 28 - ms.x, my = H_ - 24 - ms.y / 2;
+                    float mx = right_x - ms.x, my = H_ - 24 - ms.y / 2;
                     dl->AddCircleFilled(P(mx - 12, H_ - 24), 4.5f * g_s, C_TEAL);
                     text(dl, F_LABEL, 14, mx, my, C_TEAL, m.c_str());
                 }
-                if (!upd.empty()) {
-                    std::string link = std::string(TR("New version ", "Nova versão ")) + tag_label(upd, false) +
-                                       TR(" available — see what's new", " disponível — ver novidades");
-                    ImVec2 ls = text_size(F_LABEL, 14, link.c_str());
-                    float lx2 = W_ - 28 - ls.x, ly2 = H_ - 24 - ls.y / 2;
-                    ImGui::SetCursorScreenPos(P(lx2, ly2));
-                    bool click = ui_invisible_button("##update", S(ls.x, ls.y), ImGuiButtonFlags_EnableNav);
-                    bool hover = item_hot();
-                    text(dl, F_LABEL, 14, lx2, ly2, hover ? C_GOLD_HI : C_GOLD, link.c_str());
-                    if (hover) {
-                        dl->AddLine(P(lx2, ly2 + ls.y), P(lx2 + ls.x, ly2 + ls.y), C_GOLD_HI, 1.2f * g_s);
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+
+                ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(S(640, 420), ImGuiCond_Appearing);
+                if (ImGui::BeginPopupModal("##updnotes", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize)) {
+                    UpdaterSnapshot ms = updater_get_snapshot();
+                    ImGui::PushFont(g_font_menu);
+                    if (ms.state == UPD_CHK_AVAILABLE)
+                        ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s",
+                                           (std::string(TR("Update Available: ", "Atualização disponível: ")) +
+                                            updater_tag_label(ms.latest_tag, true)).c_str());
+                    else
+                        ImGui::Text("%s", TR("PokeV-Recomp Updates", "Atualizações do PokeV-Recomp"));
+                    ImGui::PopFont();
+                    ImGui::Text(TR("Installed: %s   |   Latest stable: %s", "Instalada: %s   |   Última estável: %s"),
+                                ms.current_version.c_str(),
+                                ms.latest_tag.empty() ? "-" : ms.latest_tag.c_str());
+                    if (!ms.error.empty())
+                        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", ms.error.c_str());
+                    ImGui::Spacing();
+                    ImGui::BeginChild("##upd_body", S(600, 240), true);
+                    if (!ms.notes.empty())
+                        ImGui::TextWrapped("%s", ms.notes.c_str());
+                    else
+                        ImGui::TextDisabled("%s", TR("No release notes available.", "Nenhuma nota de lançamento disponível."));
+                    ImGui::EndChild();
+                    ImGui::Spacing();
+                    if (!ms.html_url.empty()) {
+                        if (ImGui::Button(TR("Open GitHub Release", "Abrir no GitHub"), ImVec2(200 * g_s, 0)))
+                            SDL_OpenURL(ms.html_url.c_str());
+                        ImGui::SameLine();
                     }
-                    if (click) SDL_OpenURL((RELEASE_PAGE + upd).c_str());
-#ifdef _WIN32
-                    if (!upd_url.empty() && !busy) {  // "Update now" before it (not while the game code builds)
-                        const char *bl = TR("Update now", "Atualizar agora");
-                        ImVec2 bs = text_size(F_LABEL, 14, bl);
-                        float bx = lx2 - 24 - bs.x - 20, by = H_ - 24 - (bs.y + 10) / 2;
-                        ImGui::SetCursorScreenPos(P(bx, by));
-                        bool go = ui_invisible_button("##updnow", S(bs.x + 20, bs.y + 10), ImGuiButtonFlags_EnableNav);
-                        bool hot = item_hot();
-                        dl->AddRectFilled(P(bx, by), P(bx + bs.x + 20, by + bs.y + 10), hot ? C_GOLD_HI : C_GOLD, 6 * g_s);
-                        text(dl, F_LABEL, 14, bx + 10, by + 5, IM_COL32(8, 14, 24, 255), bl);
-                        if (hot) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                        // asked first: what happens, and that the player's things stay (LARECOMP_LAUNCHER_SHOT=<f>:askupdate)
-                        static bool shot_upd = getenv("LARECOMP_LAUNCHER_SHOT") && strstr(getenv("LARECOMP_LAUNCHER_SHOT"), ":askupdate");
-                        if (go || shot_upd) ImGui::OpenPopup("##updask"), shot_upd = false;
-                        ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                        if (ImGui::BeginPopupModal("##updask", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
-                            ImGui::PushFont(g_font_menu);
-                            ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", (std::string(TR("Update to version ", "Atualizar para a versão ")) +
-                                                                                 tag_label(upd, false) + "?").c_str());
-                            ImGui::PopFont();
-                            if (upd_size > 0)
-                                ImGui::Text(TR("PokeV-Recomp downloads it (%.0f MB) from GitHub, replaces its program files and opens again.",
-                                               "O PokeV-Recomp baixa a versão nova (%.0f MB) do GitHub, troca os arquivos do programa e abre de novo."),
-                                            upd_size / 1e6);
-                            else
-                                ImGui::Text("%s", TR("PokeV-Recomp downloads it from GitHub, replaces its program files and opens again.",
-                                                     "O PokeV-Recomp baixa a versão nova do GitHub, troca os arquivos do programa e abre de novo."));
-                            ImGui::TextDisabled("%s", TR("Saves, mods, settings and the compiled game are kept as they are.",
-                                                         "Saves, mods, configurações e o jogo já compilado ficam como estão."));
-                            ImGui::Spacing();
-                            if (ImGui::Button(TR("Update", "Atualizar"), ImVec2(220 * g_s, 0))) g_update_go = true, ImGui::CloseCurrentPopup();
-                            ImGui::SameLine();
-                            ImGui::SetItemDefaultFocus();
-                            if (ImGui::Button(TR("Cancel", "Cancelar"), ImVec2(220 * g_s, 0)) ||
-                                ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
-                                ImGui::CloseCurrentPopup();
-                            ImGui::EndPopup();
-                        }
+                    if (ImGui::Button(ms.state == UPD_CHK_CHECKING ? TR("Checking...", "Verificando...") : TR("Check again", "Verificar novamente"),
+                                      ImVec2(180 * g_s, 0)) && ms.state != UPD_CHK_CHECKING) {
+                        updater_start_check(true);
                     }
-#endif
+                    ImGui::SameLine();
+                    ImGui::SetItemDefaultFocus();
+                    if (ImGui::Button(TR("Close", "Fechar"), ImVec2(140 * g_s, 0)) ||
+                        ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                        ImGui::CloseCurrentPopup();
+                    ImGui::EndPopup();
                 }
             }
             if (const char *f = getenv("LARECOMP_LAUNCHER_FONT")) {  // (test) which typeface this window shows
@@ -3323,6 +3284,7 @@ extern "C" void launcher_run(const char *root) {
     }
     // play: hand the window to the game - fullscreen now, if that is the setting (the start screen always opens in a
     // window: ui_window_init and menu_apply_window_requests leave it windowed while g_start_screen is set)
+    updater_shutdown();
     settings_save();
     xbox_layout_before_play();
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(win, true);

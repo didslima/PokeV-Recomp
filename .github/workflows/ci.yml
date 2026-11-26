@@ -282,6 +282,7 @@ jobs:
             tools/test_regpromote.py
             tools/test_save.py
             tools/test_settings.py
+            tools/test_updater.py
             tools/test_vulkan_overlap.py
             tools/test_widescreen_proj.py
             tools/test_xbox_attack_prepare.py
