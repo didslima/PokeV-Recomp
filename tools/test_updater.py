@@ -379,8 +379,9 @@ def test_external_helper_e2e():
 
         dummy = subprocess.Popen([str(target)])
         helper = (
-            'PID="$1"; TGT="$2"; STG="$3"; BAK="$4"; LCK="$5"; NOTE="$6"; TAG="$7"; '
-            'i=0; while kill -0 "$PID" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; '
+            'PID="$1"; TGT="$2"; STG="$3"; BAK="$4"; LCK="$5"; NOTE="$6"; TAG="$7"; MAXI="${8:-300}"; '
+            'i=0; while kill -0 "$PID" 2>/dev/null && [ $i -lt "$MAXI" ]; do sleep 0.05; i=$((i+1)); done; '
+            'if kill -0 "$PID" 2>/dev/null; then rm -f "$STG" "$LCK"; exit 1; fi; '
             'rm -f "$BAK"; '
             'if [ -e "$TGT" ]; then '
             '  if ! ln "$TGT" "$BAK" 2>/dev/null && ! cp -p "$TGT" "$BAK" 2>/dev/null; then '
@@ -393,6 +394,7 @@ def test_external_helper_e2e():
             'fi; '
             'rm -f "$BAK" "$LCK"; '
             'if [ -n "$NOTE" ]; then mkdir -p "$(dirname "$NOTE")" 2>/dev/null || true; printf "%s" "$TAG" > "$NOTE" 2>/dev/null || true; fi; '
+            'unset APPIMAGE APPDIR ARGV0 OWD 2>/dev/null || true; '
             'exec "$TGT" >/dev/null 2>&1'
         )
         p = subprocess.Popen(
@@ -408,6 +410,31 @@ def test_external_helper_e2e():
         assert not staged.exists()
         assert not lock.exists()
         print("ok   external helper e2e (spaces, wait PID, swap, relaunch, cleanup)")
+
+        # Timeout test: PID stays alive past MAXI=4 -> abort without replacing target or relaunching
+        target.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        target.chmod(0o755)
+        staged.write_text(f"#!/bin/sh\necho should-not-run > \"{ran_marker}\"\n", encoding="utf-8")
+        staged.chmod(0o755)
+        lock.write_text("999999\n", encoding="utf-8")
+        ran_marker.unlink()
+        stubborn = subprocess.Popen([str(target)])
+        try:
+            p2 = subprocess.run(
+                ["/bin/sh", "-c", helper, "pokev-updater",
+                 str(stubborn.pid), str(target), str(staged), str(backup), str(lock), str(note), "v0.2.0", "4"],
+                timeout=5,
+            )
+            assert p2.returncode == 1
+            assert "sleep 5" in target.read_text(encoding="utf-8")
+            assert not ran_marker.exists()
+            assert not backup.exists()
+            assert not staged.exists()
+            assert not lock.exists()
+        finally:
+            stubborn.terminate()
+            stubborn.wait(timeout=5)
+        print("ok   external helper timeout preserves original AppImage and does not relaunch")
 
 
 def main():

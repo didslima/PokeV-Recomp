@@ -1221,8 +1221,9 @@ bool updater_launch_external_apply_and_exit_ready() {
     // Positional-arg POSIX /bin/sh helper: waits for this PID, backs up target, atomically moves staged -> target,
     // rolls back on failure, cleans temp files, writes _updated.txt, and relaunches target.
     static const char *k_helper =
-        "PID=\"$1\"; TGT=\"$2\"; STG=\"$3\"; BAK=\"$4\"; LCK=\"$5\"; NOTE=\"$6\"; TAG=\"$7\"; "
-        "i=0; while kill -0 \"$PID\" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; "
+        "PID=\"$1\"; TGT=\"$2\"; STG=\"$3\"; BAK=\"$4\"; LCK=\"$5\"; NOTE=\"$6\"; TAG=\"$7\"; MAXI=\"${8:-300}\"; "
+        "i=0; while kill -0 \"$PID\" 2>/dev/null && [ $i -lt \"$MAXI\" ]; do sleep 0.05; i=$((i+1)); done; "
+        "if kill -0 \"$PID\" 2>/dev/null; then rm -f \"$STG\" \"$LCK\"; exit 1; fi; "
         "rm -f \"$BAK\"; "
         "if [ -e \"$TGT\" ]; then "
         "  if ! ln \"$TGT\" \"$BAK\" 2>/dev/null && ! cp -p \"$TGT\" \"$BAK\" 2>/dev/null; then "
@@ -1235,6 +1236,7 @@ bool updater_launch_external_apply_and_exit_ready() {
         "fi; "
         "rm -f \"$BAK\" \"$LCK\"; "
         "if [ -n \"$NOTE\" ]; then mkdir -p \"$(dirname \"$NOTE\")\" 2>/dev/null || true; printf '%s' \"$TAG\" > \"$NOTE\" 2>/dev/null || true; fi; "
+        "unset APPIMAGE APPDIR ARGV0 OWD 2>/dev/null || true; "
         "exec \"$TGT\" >/dev/null 2>&1";
 
     std::string pid_str = std::to_string((long)getpid());
