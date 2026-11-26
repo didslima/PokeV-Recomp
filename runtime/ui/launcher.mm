@@ -3142,7 +3142,24 @@ extern "C" void launcher_run(const char *root) {
                     bool open_notes_modal = false;
                     bool retry_click = false;
 
-                    if (us.state == UPD_CHK_CHECKING) {
+                    if (us.install_state == UPD_INST_DOWNLOADING) {
+                        int pct = us.total_bytes > 0 ? (int)((us.downloaded_bytes * 100) / us.total_bytes) : -1;
+                        link = std::string(TR("Downloading update", "Baixando atualização")) +
+                               (pct >= 0 ? " (" + std::to_string(pct > 100 ? 100 : pct) + "%)" : "...") +
+                               TR(" — details", " — detalhes");
+                        col = C_TEAL;
+                        col_hi = C_GOLD_HI;
+                        open_notes_modal = true;
+                    } else if (us.install_state == UPD_INST_VERIFYING) {
+                        link = TR("Verifying SHA-256 checksum...", "Verificando checksum SHA-256...");
+                        col = C_TEAL;
+                        open_notes_modal = true;
+                    } else if (us.install_state == UPD_INST_STAGED) {
+                        link = TR("Update ready — Install & Restart", "Atualização pronta — Instalar e reiniciar");
+                        col = C_GOLD;
+                        col_hi = C_GOLD_HI;
+                        open_notes_modal = true;
+                    } else if (us.state == UPD_CHK_CHECKING) {
                         link = TR("Checking for updates...", "Verificando atualizações...");
                     } else if (us.state == UPD_CHK_AVAILABLE) {
                         link = std::string(TR("New version ", "Nova versão ")) +
@@ -3183,8 +3200,9 @@ extern "C" void launcher_run(const char *root) {
                         right_x = lx2 - 24;
                     }
                 }
-                if (!updated.empty() && upd.empty() && ust == UPD_IDLE) {  // (just updated: left of checker status)
-                    std::string m = std::string(TR("Updated to version ", "Atualizado para a versão ")) + tag_label(updated, false);
+                std::string done_tag = !updated.empty() ? updated : us.updated_from_tag;
+                if (!done_tag.empty() && upd.empty() && ust == UPD_IDLE) {  // (just updated: left of checker status)
+                    std::string m = std::string(TR("Updated to version ", "Atualizado para a versão ")) + tag_label(done_tag, false);
                     ImVec2 ms = text_size(F_LABEL, 14, m.c_str());
                     float mx = right_x - ms.x, my = H_ - 24 - ms.y / 2;
                     dl->AddCircleFilled(P(mx - 12, H_ - 24), 4.5f * g_s, C_TEAL);
@@ -3192,7 +3210,7 @@ extern "C" void launcher_run(const char *root) {
                 }
 
                 ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                ImGui::SetNextWindowSize(S(640, 420), ImGuiCond_Appearing);
+                ImGui::SetNextWindowSize(S(640, 460), ImGuiCond_Appearing);
                 if (ImGui::BeginPopupModal("##updnotes", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize)) {
                     UpdaterSnapshot ms = updater_get_snapshot();
                     ImGui::PushFont(g_font_menu);
@@ -3208,24 +3226,96 @@ extern "C" void launcher_run(const char *root) {
                                 ms.latest_tag.empty() ? "-" : ms.latest_tag.c_str());
                     if (!ms.error.empty())
                         ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", ms.error.c_str());
+                    if (!ms.install_error.empty())
+                        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", ms.install_error.c_str());
                     ImGui::Spacing();
-                    ImGui::BeginChild("##upd_body", S(600, 240), true);
+                    ImGui::BeginChild("##upd_body", S(600, 220), true);
                     if (!ms.notes.empty())
                         ImGui::TextWrapped("%s", ms.notes.c_str());
                     else
                         ImGui::TextDisabled("%s", TR("No release notes available.", "Nenhuma nota de lançamento disponível."));
                     ImGui::EndChild();
                     ImGui::Spacing();
+
+                    if (ms.state == UPD_CHK_AVAILABLE) {
+                        if (ms.install_kind == UPD_INSTALL_LINUX_APPIMAGE) {
+                            if (ms.install_state == UPD_INST_DOWNLOADING) {
+                                float frac = ms.total_bytes > 0 ? (float)ms.downloaded_bytes / (float)ms.total_bytes : 0.0f;
+                                if (frac > 1.0f) frac = 1.0f;
+                                char pbuf[96];
+                                if (ms.total_bytes > 0)
+                                    snprintf(pbuf, sizeof pbuf, "%.1f / %.1f MB", ms.downloaded_bytes / 1e6, ms.total_bytes / 1e6);
+                                else
+                                    snprintf(pbuf, sizeof pbuf, "%.1f MB", ms.downloaded_bytes / 1e6);
+                                ImGui::ProgressBar(frac, ImVec2(420 * g_s, 0), pbuf);
+                                ImGui::SameLine();
+                                if (ImGui::Button(TR("Cancel Download", "Cancelar download"), ImVec2(170 * g_s, 0)))
+                                    updater_cancel_install();
+                            } else if (ms.install_state == UPD_INST_VERIFYING) {
+                                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.85f, 1), "%s",
+                                                   TR("Verifying SHA-256 checksum...", "Verificando checksum SHA-256..."));
+                            } else if (ms.install_state == UPD_INST_STAGED) {
+                                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.85f, 1), "%s",
+                                                   TR("Verified (SHA-256 OK). Ready to replace AppImage and restart.",
+                                                      "Verificado (SHA-256 OK). Pronto para substituir o AppImage e reiniciar."));
+                                if (ImGui::Button(TR("Install & Restart", "Instalar e reiniciar"), ImVec2(220 * g_s, 0))) {
+                                    if (updater_launch_external_apply_and_exit_ready()) {
+                                        updater_shutdown();
+                                        exit(0);
+                                    }
+                                }
+                                ImGui::SameLine();
+                            } else if (!ms.linux_asset_url.empty() && !ms.sha256sums_url.empty()) {
+                                if (ImGui::Button(TR("Download & Update", "Baixar e atualizar"), ImVec2(200 * g_s, 0)))
+                                    ImGui::OpenPopup("##updconfirm_linux");
+                                ImGui::SameLine();
+                            }
+                        } else if (!ms.install_reason.empty()) {
+                            ImGui::TextDisabled("%s", ms.install_reason.c_str());
+                        }
+                    }
+
+                    ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+                    if (ImGui::BeginPopupModal("##updconfirm_linux", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+                        ImGui::PushFont(g_font_menu);
+                        ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s",
+                                           (std::string(TR("Update AppImage to ", "Atualizar AppImage para ")) +
+                                            updater_tag_label(ms.latest_tag, false) + "?").c_str());
+                        ImGui::PopFont();
+                        if (ms.linux_asset_size > 0)
+                            ImGui::Text(TR("Downloads %.1f MB from GitHub, verifies SHA-256, backs up your current AppImage and restarts.",
+                                           "Baixa %.1f MB do GitHub, verifica o SHA-256, faz backup do AppImage atual e reinicia."),
+                                        ms.linux_asset_size / 1e6);
+                        else
+                            ImGui::Text("%s", TR("Downloads the new AppImage from GitHub, verifies SHA-256, backs up the current one and restarts.",
+                                                 "Baixa o novo AppImage do GitHub, verifica o SHA-256, faz backup do atual e reinicia."));
+                        ImGui::TextDisabled("%s", TR("Saves, settings, mods and compiled game data are never modified.",
+                                                     "Saves, configurações, mods e dados do jogo nunca são alterados."));
+                        ImGui::Spacing();
+                        if (ImGui::Button(TR("Confirm", "Confirmar"), ImVec2(180 * g_s, 0))) {
+                            updater_start_install();
+                            ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                        ImGui::SetItemDefaultFocus();
+                        if (ImGui::Button(TR("Cancel", "Cancelar"), ImVec2(180 * g_s, 0)) ||
+                            ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                            ImGui::CloseCurrentPopup();
+                        ImGui::EndPopup();
+                    }
+
                     if (!ms.html_url.empty()) {
                         if (ImGui::Button(TR("Open GitHub Release", "Abrir no GitHub"), ImVec2(200 * g_s, 0)))
                             SDL_OpenURL(ms.html_url.c_str());
                         ImGui::SameLine();
                     }
-                    if (ImGui::Button(ms.state == UPD_CHK_CHECKING ? TR("Checking...", "Verificando...") : TR("Check again", "Verificar novamente"),
-                                      ImVec2(180 * g_s, 0)) && ms.state != UPD_CHK_CHECKING) {
-                        updater_start_check(true);
+                    if (ms.install_state != UPD_INST_DOWNLOADING && ms.install_state != UPD_INST_VERIFYING) {
+                        if (ImGui::Button(ms.state == UPD_CHK_CHECKING ? TR("Checking...", "Verificando...") : TR("Check again", "Verificar novamente"),
+                                          ImVec2(180 * g_s, 0)) && ms.state != UPD_CHK_CHECKING) {
+                            updater_start_check(true);
+                        }
+                        ImGui::SameLine();
                     }
-                    ImGui::SameLine();
                     ImGui::SetItemDefaultFocus();
                     if (ImGui::Button(TR("Close", "Fechar"), ImVec2(140 * g_s, 0)) ||
                         ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
