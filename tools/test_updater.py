@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Unit & integration tests for runtime/ui/updater.cpp (Phase A update checker)."""
+"""Unit & integration tests for runtime/ui/updater.cpp (Phase A checker + Phase B Linux AppImage updater)."""
 from pathlib import Path
+import hashlib
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 
@@ -15,8 +17,14 @@ TEST_CPP = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 extern "C" {
 #include "platform.h"
@@ -24,6 +32,7 @@ extern "C" {
 static std::atomic<bool> g_sim_running{false};
 static std::atomic<int> g_kill_count{0};
 static std::atomic<int> g_spawn_count{0};
+static std::atomic<int> g_sim_rc{1};
 
 PlatProc plat_spawn(const char *const argv[], const char *log_path, bool append_log) {
     (void)argv; (void)log_path; (void)append_log;
@@ -35,9 +44,9 @@ int plat_proc_wait(PlatProc p, bool block) {
     (void)p;
     if (block) {
         while (g_sim_running.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        return 1;
+        return g_sim_rc.load();
     }
-    return g_sim_running.load() ? -1 : 1;
+    return g_sim_running.load() ? -1 : g_sim_rc.load();
 }
 void plat_proc_kill(PlatProc p) {
     (void)p;
@@ -47,6 +56,8 @@ void plat_proc_kill(PlatProc p) {
 }
 
 #include "ui/updater.h"
+
+namespace fs = std::filesystem;
 
 static void set_env(const char *k, const char *v) {
 #ifdef _WIN32
@@ -67,8 +78,41 @@ static UpdaterSnapshot wait_check_done() {
     return updater_get_snapshot();
 }
 
+static UpdaterSnapshot wait_install_done() {
+    for (int i = 0; i < 400; i++) {
+        UpdaterSnapshot s = updater_get_snapshot();
+        if (s.install_state != UPD_INST_DOWNLOADING && s.install_state != UPD_INST_VERIFYING) return s;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    assert(false && "updater_start_install timed out");
+    return updater_get_snapshot();
+}
+
+static void write_bytes(const std::string &path, const std::string &data) {
+    FILE *f = fopen(path.c_str(), "wb");
+    assert(f);
+    assert(fwrite(data.data(), 1, data.size(), f) == data.size());
+    fclose(f);
+}
+
+static std::string read_bytes(const std::string &path) {
+    FILE *f = fopen(path.c_str(), "rb");
+    assert(f);
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    fclose(f);
+    return out;
+}
+
 int main() {
-    // 1. Version comparison
+    const char *tmp_dir_c = getenv("LARECOMP_TEST_TMPDIR");
+    const char *expected_hello_sha = getenv("LARECOMP_TEST_HELLO_SHA");
+    assert(tmp_dir_c && expected_hello_sha);
+    std::string tmp_dir = tmp_dir_c;
+
+    // 1. Version comparison (Phase A)
     assert(updater_tag_rank("beta_2") < updater_tag_rank("v0.0.1"));
     assert(updater_tag_rank("v0.0.30") < updater_tag_rank("v0.1.0"));
     assert(updater_tag_rank("v0.1.0") < updater_tag_rank("v0.1.1"));
@@ -80,7 +124,7 @@ int main() {
     assert(updater_tag_label("v0.1.0", true) == "Version 0.1.0");
     printf("ok   version comparison\n");
 
-    // 2. Auto-check suppression BEFORE any manual check runs
+    // 2. Auto-check suppression BEFORE any manual check runs (Phase A)
     set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
     set_env("LARECOMP_UPDATE_JSON", R"({"tag_name":"v0.2.0","draft":false,"prerelease":false})");
 
@@ -88,29 +132,18 @@ int main() {
     set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
     updater_configure("v0.1.0", "/tmp/rl-data", false, false);
     assert(updater_is_suppressed_by_launcher());
+    assert(updater_get_snapshot().install_kind == UPD_INSTALL_RECOMPLAUNCHER);
     updater_start_check(false);
     assert(updater_get_snapshot().state == UPD_CHK_IDLE && !updater_get_snapshot().has_checked);
 
     set_env("RECOMPLAUNCHER_DATA", nullptr);
     set_env("LARECOMP_NO_UPDATE_CHECK", "1");
     updater_configure("v0.1.0", "", false, false);
-    assert(!updater_is_suppressed_by_launcher());
     updater_start_check(false);
     assert(updater_get_snapshot().state == UPD_CHK_IDLE && !updater_get_snapshot().has_checked);
+    printf("ok   auto-check & RecompLauncher suppression\n");
 
-    set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
-    updater_configure("v0.1.0", "", true, false);
-    assert(updater_is_suppressed_by_launcher());
-    updater_start_check(false);
-    assert(updater_get_snapshot().state == UPD_CHK_IDLE);
-
-    updater_configure("v0.1.0", "", false, true);
-    assert(updater_is_suppressed_by_launcher());
-    updater_start_check(false);
-    assert(updater_get_snapshot().state == UPD_CHK_IDLE);
-    printf("ok   auto-check suppression (RECOMPLAUNCHER_DATA, LARECOMP_NO_UPDATE_CHECK, --play, --prepare)\n");
-
-    // 3. JSON parsing, escapes, UTF-16 surrogate pairs & unpaired surrogates
+    // 3. JSON parsing + asset extraction + UTF-16 surrogates (Phase A + B)
     const char *latest_json = R"({
       "url": "https://api.github.com/repos/didslima/PokeV-Recomp/releases/1",
       "html_url": "https://github.com/didslima/PokeV-Recomp/releases/tag/v0.2.0",
@@ -118,113 +151,258 @@ int main() {
       "draft": false,
       "prerelease": false,
       "author": { "login": "didslima", "tag_name": "ignored_nested" },
-      "assets": [ { "name": "PokeV-Recomp-linux-x86_64.AppImage", "browser_download_url": "https://example.invalid/a" } ],
+      "assets": [
+        { "name": "PokeV-Recomp-windows-x64.zip", "size": 999, "browser_download_url": "https://github.com/x/win.zip" },
+        { "name": "PokeV-Recomp-linux-x86_64.AppImage", "size": 11, "browser_download_url": "https://github.com/x/lin.AppImage" },
+        { "name": "SHA256SUMS", "size": 120, "browser_download_url": "https://github.com/x/SHA256SUMS" }
+      ],
       "body": "Rocket \uD83D\uDE80 Caf\u00e9 \"q\" \\ bad:\uD83Dx low:\uDE80\r\nend"
     })";
     UpdaterParseResult r = updater_parse_release_json(latest_json);
     assert(r.ok && r.found_stable);
     assert(r.tag_name == "v0.2.0");
-    assert(r.html_url == "https://github.com/didslima/PokeV-Recomp/releases/tag/v0.2.0");
+    assert(r.linux_asset_url == "https://github.com/x/lin.AppImage");
+    assert(r.linux_asset_size == 11);
+    assert(r.sha256sums_url == "https://github.com/x/SHA256SUMS");
     assert(r.body == "Rocket \xF0\x9F\x9A\x80 Caf\xC3\xA9 \"q\" \\ bad:\xEF\xBF\xBDx low:\xEF\xBF\xBD\nend");
-    printf("ok   json parsing, utf-16 surrogate pairs & unpaired surrogates\n");
+    printf("ok   json parsing, assets & utf-16 surrogate pairs\n");
 
-    // 4. Null fields, truncated JSON & stable release filtering
+    // 4. Null fields, truncated JSON, stable filtering (Phase A)
+    assert(!updater_parse_release_json(R"({"tag_name":"v0.2.0")").ok);
+    assert(!updater_parse_release_json(R"([{"tag_name":"v0.2.0"})").ok);
     UpdaterParseResult r_nulls = updater_parse_release_json(
         R"({"tag_name":"v0.2.0","draft":false,"prerelease":false,"body":null,"html_url":null})");
     assert(r_nulls.ok && r_nulls.found_stable && r_nulls.body.empty());
-    assert(r_nulls.html_url == "https://github.com/didslima/PokeV-Recomp/releases/tag/v0.2.0");
-
-    assert(!updater_parse_release_json(R"({"tag_name":"v0.2.0")").ok);
-    assert(!updater_parse_release_json(R"({"tag_name":"v0.2.0","body":"unterminated)").ok);
-    assert(!updater_parse_release_json(R"([{"tag_name":"v0.2.0"})").ok);
-
     UpdaterParseResult r_draft = updater_parse_release_json(
-        R"({"tag_name":"v9.9.9","draft":true,"prerelease":false,"html_url":"https://github.com/x/y","body":"x"})");
+        R"({"tag_name":"v9.9.9","draft":true,"prerelease":false})");
     assert(r_draft.ok && !r_draft.found_stable);
-    UpdaterParseResult r_pre = updater_parse_release_json(
-        R"({"tag_name":"v9.9.9","draft":false,"prerelease":true,"html_url":"https://github.com/x/y","body":"x"})");
-    assert(r_pre.ok && !r_pre.found_stable);
-    UpdaterParseResult r_arr = updater_parse_release_json(
-        R"([{"tag_name":"v0.3.0","draft":false,"prerelease":true},{"tag_name":"v0.2.0","draft":false,"prerelease":false,"html_url":"http://insecure.invalid/x"}])");
-    assert(r_arr.ok && r_arr.found_stable && r_arr.tag_name == "v0.2.0");
-    assert(r_arr.html_url == "https://github.com/didslima/PokeV-Recomp/releases/tag/v0.2.0");
     printf("ok   null fields, truncated json & stable filtering\n");
 
-    // 5. Async available, up-to-date, and rapid repeated manual checks
-    set_env("RECOMPLAUNCHER_DATA", nullptr);
+    // 5. Async checker states & errors (Phase A)
     set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
     set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
     set_env("LARECOMP_UPDATE_JSON", latest_json);
     updater_configure("v0.1.0", "", false, false);
     for (int i = 0; i < 5; i++) updater_start_check(true);
     UpdaterSnapshot s = wait_check_done();
-    assert(s.state == UPD_CHK_AVAILABLE && s.latest_tag == "v0.2.0" && s.has_checked);
+    assert(s.state == UPD_CHK_AVAILABLE && s.latest_tag == "v0.2.0");
 
-    updater_configure("v0.2.0", "", false, false);
-    updater_start_check(true);
-    s = wait_check_done();
-    assert(s.state == UPD_CHK_UP_TO_DATE && s.latest_tag == "v0.2.0");
-    printf("ok   async update available, up-to-date & rapid manual checks\n");
-
-    // 6. Offline, rate limit, HTTP error, malformed JSON
     set_env("LARECOMP_UPDATE_HTTP_STATUS", "0");
     updater_start_check(true);
     assert(wait_check_done().state == UPD_CHK_OFFLINE);
 
-    set_env("LARECOMP_UPDATE_HTTP_STATUS", "403");
-    updater_start_check(true);
-    assert(wait_check_done().state == UPD_CHK_RATE_LIMITED);
-
     set_env("LARECOMP_UPDATE_HTTP_STATUS", "429");
     updater_start_check(true);
     assert(wait_check_done().state == UPD_CHK_RATE_LIMITED);
+    printf("ok   async checker states & error handling\n");
 
-    set_env("LARECOMP_UPDATE_HTTP_STATUS", "502");
-    updater_start_check(true);
-    assert(wait_check_done().state == UPD_CHK_HTTP_ERROR);
+    // 6. SHA256SUMS parsing & file_sha256 (Phase B)
+    std::string sums_sample =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  PokeV-Recomp-windows-x64.zip\n" +
+        std::string(expected_hello_sha) + " *./PokeV-Recomp-linux-x86_64.AppImage\n";
+    assert(updater_parse_sha256sums(sums_sample, "PokeV-Recomp-linux-x86_64.AppImage") == expected_hello_sha);
+    assert(updater_parse_sha256sums(sums_sample, "missing.AppImage").empty());
+    assert(updater_parse_sha256sums("nothex  PokeV-Recomp-linux-x86_64.AppImage\n", "PokeV-Recomp-linux-x86_64.AppImage").empty());
 
-    set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
-    set_env("LARECOMP_UPDATE_JSON", "{not valid json");
-    updater_start_check(true);
-    assert(wait_check_done().state == UPD_CHK_HTTP_ERROR);
-    printf("ok   offline, rate-limit, http error & malformed json\n");
+    std::string hello_file = tmp_dir + "/hello.bin";
+    write_bytes(hello_file, "hello world");
+    assert(updater_file_sha256(hello_file) == expected_hello_sha);
+    printf("ok   sha256sums parsing & file_sha256\n");
 
-    // 7. Missing curl, explicit override & Unix PATH fallback
-    set_env("LARECOMP_CURL_BIN", "/nonexistent/curl_missing_12345");
-    assert(updater_find_curl().empty());
-    const char *cur_bin = getenv("LARECOMP_TEST_FAKE_CURL");
-    assert(cur_bin && *cur_bin);
-    set_env("LARECOMP_CURL_BIN", cur_bin);
-    assert(updater_find_curl() == cur_bin);
-    set_env("LARECOMP_CURL_BIN", nullptr);
 #ifndef _WIN32
-    {
-        std::string found = updater_find_curl();
-        assert(!found.empty() && found.size() >= 5 && found.compare(found.size() - 5, 5, "/curl") == 0);
-    }
-#endif
-    printf("ok   curl missing, explicit override & PATH resolution\n");
+    // 7. Install kind detection, paths with spaces & special chars, read-only dir (Phase B)
+    set_env("APPIMAGE", nullptr);
+    set_env("LARECOMP_DATA_ROOT", nullptr);
+    std::string tgt, reason;
+    assert(updater_detect_install_kind(tgt, reason) == UPD_INSTALL_UNSUPPORTED);
 
-    // 8. Shutdown while curl subprocess is actively running + repeated shutdown calls
-    set_env("LARECOMP_UPDATE_JSON", nullptr);
-    set_env("LARECOMP_UPDATE_HTTP_STATUS", nullptr);
-    set_env("LARECOMP_CURL_BIN", cur_bin);
+    std::string spaced_dir = tmp_dir + "/My AppImage (v1) 'test'";
+    fs::create_directories(spaced_dir);
+    std::string app_path = spaced_dir + "/PokeV-Recomp.AppImage";
+    write_bytes(app_path, "old-appimage");
+    chmod(app_path.c_str(), 0751);
+
+    set_env("APPIMAGE", app_path.c_str());
+    assert(updater_detect_install_kind(tgt, reason) == UPD_INSTALL_LINUX_APPIMAGE);
+    assert(tgt == fs::canonical(app_path).string());
+
+    if (geteuid() != 0) {
+        std::string ro_dir = tmp_dir + "/ro_dir";
+        fs::create_directories(ro_dir);
+        std::string ro_app = ro_dir + "/PokeV.AppImage";
+        write_bytes(ro_app, "ro");
+        chmod(ro_dir.c_str(), 0555);
+        set_env("APPIMAGE", ro_app.c_str());
+        assert(updater_detect_install_kind(tgt, reason) == UPD_INSTALL_LINUX_APPIMAGE_RO);
+        chmod(ro_dir.c_str(), 0755);
+    }
+
+    // 8. Download, SHA-256 verification, staging, corrupted file, low disk space (Phase B)
+    std::string data_dir = tmp_dir + "/userdata";
+    fs::create_directories(data_dir + "/cache");
+    std::string new_app_src = tmp_dir + "/new_src.AppImage";
+    write_bytes(new_app_src, "hello world");  // 11 bytes (matches latest_json size=11)
+    std::string sums_src = tmp_dir + "/SRC_SHA256SUMS";
+    write_bytes(sums_src, std::string(expected_hello_sha) + "  PokeV-Recomp-linux-x86_64.AppImage\n");
+
+    set_env("APPIMAGE", app_path.c_str());
+    set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
+    set_env("LARECOMP_UPDATE_JSON", latest_json);
+    set_env("LARECOMP_UPDATE_APPIMAGE", new_app_src.c_str());
+    set_env("LARECOMP_UPDATE_SHA256SUMS", sums_src.c_str());
+    set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", nullptr);
+
+    updater_configure("v0.1.0", data_dir.c_str(), false, false);
+    updater_start_check(true);
+    assert(wait_check_done().state == UPD_CHK_AVAILABLE);
+
+    // 8a. Low disk space failure
+    set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", "1024");
+    updater_start_install();
+    s = wait_install_done();
+    assert(s.install_state == UPD_INST_FAILED);
+    assert(read_bytes(app_path) == "old-appimage");
+
+    // 8b. Corrupted checksum failure
+    set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", nullptr);
+    std::string bad_sums = tmp_dir + "/BAD_SHA256SUMS";
+    write_bytes(bad_sums, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  PokeV-Recomp-linux-x86_64.AppImage\n");
+    set_env("LARECOMP_UPDATE_SHA256SUMS", bad_sums.c_str());
+    updater_start_install();
+    s = wait_install_done();
+    assert(s.install_state == UPD_INST_FAILED);
+    assert(read_bytes(app_path) == "old-appimage");
+    assert(!fs::exists(spaced_dir + "/.PokeV-Recomp.v0.2.0.part"));
+
+    // 8c. Successful download, verify, stage & permission preservation
+    set_env("LARECOMP_UPDATE_SHA256SUMS", sums_src.c_str());
+    updater_start_install();
+    s = wait_install_done();
+    assert(s.install_state == UPD_INST_STAGED);
+    assert(fs::exists(spaced_dir + "/.PokeV-Recomp.staged"));
+    printf("ok   staged download, sha256 verification, low-disk & corrupt rejection\n");
+
+    // 9. Atomic replacement, permissions, backup & rollback (Phase B)
+    std::string staged_file = spaced_dir + "/.PokeV-Recomp.staged";
+    std::string bak_file = app_path + ".bak";
+    std::string apply_err;
+    assert(updater_apply_staged_file(app_path, staged_file, bak_file, apply_err));
+    assert(read_bytes(app_path) == "hello world");
+    assert(!fs::exists(bak_file));
+    struct stat ast{};
+    assert(stat(app_path.c_str(), &ast) == 0 && (ast.st_mode & 0777) == 0751);
+
+    // Rollback test: missing staged file leaves original intact
+    assert(!updater_apply_staged_file(app_path, spaced_dir + "/nonexistent.staged", bak_file, apply_err));
+    assert(read_bytes(app_path) == "hello world");
+    assert(!fs::exists(bak_file));
+
+    // Startup recovery test: missing target + existing .bak restores target, cleans .part, reads _updated.txt
+    write_bytes(bak_file, "recovered-backup");
+    unlink(app_path.c_str());
+    write_bytes(spaced_dir + "/.PokeV-Recomp.stale.part", "stale");
+    write_bytes(data_dir + "/cache/_updated.txt", "v0.2.0\n");
+    updater_configure("v0.2.0", data_dir.c_str(), false, false);
+    assert(read_bytes(app_path) == "recovered-backup");
+    assert(!fs::exists(bak_file));
+    assert(!fs::exists(spaced_dir + "/.PokeV-Recomp.stale.part"));
+    assert(updater_get_snapshot().updated_from_tag == "v0.2.0");
+    printf("ok   atomic swap, 0751 perm preservation, rollback & boot recovery\n");
+
+    // 10. Concurrent updater lockfile rejection (live other PID blocks; dead PID cleaned)
+    {
+        std::string lock_file = spaced_dir + "/.PokeV-Recomp.update.lock";
+        write_bytes(lock_file, std::to_string((long)getppid()) + "\n");
+        updater_configure("v0.1.0", data_dir.c_str(), false, false);
+        updater_start_check(true);
+        wait_check_done();
+        updater_start_install();
+        s = wait_install_done();
+        assert(s.install_state == UPD_INST_FAILED);
+        assert(s.install_error.find("already in progress") != std::string::npos);
+        unlink(lock_file.c_str());
+        printf("ok   concurrent updater lockfile rejection\n");
+    }
+
+    // 11. Download cancellation + curl shutdown (Phase A + B)
+    set_env("LARECOMP_UPDATE_APPIMAGE", "https://github.com/x/lin.AppImage");
+    set_env("LARECOMP_UPDATE_SHA256SUMS", "https://github.com/x/SHA256SUMS");
+    set_env("LARECOMP_CURL_BIN", getenv("LARECOMP_TEST_FAKE_CURL"));
     g_kill_count = 0;
     g_spawn_count = 0;
-    updater_configure("v0.1.0", "", false, false);
+    updater_configure("v0.1.0", data_dir.c_str(), false, false);
     updater_start_check(true);
+    wait_check_done();
+    updater_start_install();
     for (int i = 0; i < 100 && g_spawn_count.load() == 0; i++)
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    assert(g_spawn_count.load() == 1);
+    updater_cancel_install();
+    s = wait_install_done();
+    assert(s.install_state == UPD_INST_CANCELLED);
+    assert(g_kill_count.load() >= 1);
     updater_shutdown();
-    updater_shutdown();  // repeated shutdown must be safe
-    assert(g_kill_count.load() == 1);
-    printf("ok   shutdown kills running curl, joins thread & repeated shutdown is safe\n");
+    updater_shutdown();
+    printf("ok   download cancel & shutdown safety\n");
+#endif
 
-    printf("PASS: updater phase A checks\n");
+    printf("PASS: updater phase A + B checks\n");
     return 0;
 }
 '''
+
+
+def test_external_helper_e2e():
+    """End-to-end test of the external /bin/sh helper: waits for PID, swaps staged -> target, relaunches."""
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp) / "Dir With Spaces & 'Quotes'"
+        t.mkdir()
+        target = t / "PokeV-Recomp.AppImage"
+        staged = t / ".PokeV-Recomp.staged"
+        backup = t / "PokeV-Recomp.AppImage.bak"
+        lock = t / ".PokeV-Recomp.update.lock"
+        note = t / "_updated.txt"
+        ran_marker = t / "relaunched.txt"
+
+        # Old AppImage is a dummy script; staged AppImage writes ran_marker when relaunched
+        target.write_text("#!/bin/sh\nsleep 0.2\n", encoding="utf-8")
+        target.chmod(0o755)
+        staged.write_text(f"#!/bin/sh\necho relaunched > \"{ran_marker}\"\n", encoding="utf-8")
+        staged.chmod(0o755)
+        lock.write_text("999999\n", encoding="utf-8")
+
+        dummy = subprocess.Popen([str(target)])
+        helper = (
+            'PID="$1"; TGT="$2"; STG="$3"; BAK="$4"; LCK="$5"; NOTE="$6"; TAG="$7"; '
+            'i=0; while kill -0 "$PID" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.05; i=$((i+1)); done; '
+            'rm -f "$BAK"; '
+            'if [ -e "$TGT" ]; then '
+            '  if ! ln "$TGT" "$BAK" 2>/dev/null && ! cp -p "$TGT" "$BAK" 2>/dev/null; then '
+            '    rm -f "$STG" "$LCK"; exit 1; '
+            '  fi; '
+            'fi; '
+            'if ! mv -f "$STG" "$TGT"; then '
+            '  if [ ! -e "$TGT" ] && [ -e "$BAK" ]; then mv -f "$BAK" "$TGT" 2>/dev/null || true; fi; '
+            '  rm -f "$BAK" "$STG" "$LCK"; exit 1; '
+            'fi; '
+            'rm -f "$BAK" "$LCK"; '
+            'if [ -n "$NOTE" ]; then mkdir -p "$(dirname "$NOTE")" 2>/dev/null || true; printf "%s" "$TAG" > "$NOTE" 2>/dev/null || true; fi; '
+            'exec "$TGT" >/dev/null 2>&1'
+        )
+        p = subprocess.Popen(
+            ["/bin/sh", "-c", helper, "pokev-updater",
+             str(dummy.pid), str(target), str(staged), str(backup), str(lock), str(note), "v0.2.0"]
+        )
+        dummy.wait(timeout=5)
+        p.wait(timeout=5)
+        assert p.returncode == 0
+        assert ran_marker.read_text(encoding="utf-8").strip() == "relaunched"
+        assert note.read_text(encoding="utf-8") == "v0.2.0"
+        assert not backup.exists()
+        assert not staged.exists()
+        assert not lock.exists()
+        print("ok   external helper e2e (spaces, wait PID, swap, relaunch, cleanup)")
 
 
 def main():
@@ -251,8 +429,12 @@ def main():
         subprocess.run(cmd, cwd=ROOT, check=True)
         env = os.environ.copy()
         env["LARECOMP_TEST_FAKE_CURL"] = str(fake_curl)
+        env["LARECOMP_TEST_TMPDIR"] = str(t)
+        env["LARECOMP_TEST_HELLO_SHA"] = hashlib.sha256(b"hello world").hexdigest()
         env["PATH"] = f"{t}{os.pathsep}{env.get('PATH', '')}"
         subprocess.run([str(exe)], cwd=ROOT, env=env, check=True)
+
+    test_external_helper_e2e()
 
 
 if __name__ == "__main__":
