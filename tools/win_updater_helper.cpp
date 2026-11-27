@@ -221,7 +221,161 @@ static bool wait_for_parent_exit(DWORD pid, uintptr_t handle_val, DWORD timeout_
     return true;
 }
 
+static bool collect_relative_files(const std::wstring &base_dir, const std::wstring &sub_rel,
+                                   std::vector<std::wstring> &out) {
+    std::wstring cur = sub_rel.empty() ? base_dir : join_path(base_dir, sub_rel);
+    std::wstring pat = to_long_win_path(join_path(cur, L"*"));
+    WIN32_FIND_DATAW ffd{};
+    HANDLE h = FindFirstFileW(pat.c_str(), &ffd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    do {
+        if (wcscmp(ffd.cFileName, L".") == 0 || wcscmp(ffd.cFileName, L"..") == 0) continue;
+        std::wstring rel = sub_rel.empty() ? std::wstring(ffd.cFileName) : join_path(sub_rel, ffd.cFileName);
+        if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+        if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            collect_relative_files(base_dir, rel, out);
+        } else {
+            out.push_back(rel);
+        }
+    } while (FindNextFileW(h, &ffd));
+    FindClose(h);
+    return true;
+}
+
+static bool validate_critical_install_files(const std::wstring &install_dir, std::string &out_missing) {
+    static const wchar_t *const k_critical[] = {
+        L"PokeV-Recomp.exe",
+        L"za-default.ini",
+        L"recomplauncher.json",
+        L"gamelib-src\\gamelib_entry.c",
+        L"zaimport\\zaimport.exe",
+        L"zig\\zig.exe",
+        L"lasgen\\lasgen.exe",
+    };
+    for (const wchar_t *c : k_critical) {
+        if (!file_exists_nonempty(join_path(install_dir, c), true)) {
+            out_missing = wide_to_utf8(c);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void relaunch_app(const std::wstring &install_dir) {
+    std::wstring exe_path = join_path(install_dir, L"PokeV-Recomp.exe");
+    std::wstring cmd = L"\"" + exe_path + L"\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(to_long_win_path(exe_path).c_str(), cmd.data(), nullptr, nullptr, FALSE,
+                       DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                       nullptr, to_long_win_path(install_dir).c_str(), &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+}
+
+static int run_recover_mode(int argc, wchar_t **argv) {
+    // --recover <pid> <handle_val> <install_dir> <backup_dir> <lock_path> [timeout_ms] [relaunch_flag]
+    if (argc < 7) return 10;
+
+    DWORD pid = (DWORD)wcstoul(argv[2], nullptr, 10);
+    uintptr_t handle_val = (uintptr_t)wcstoull(argv[3], nullptr, 10);
+    std::wstring install_dir = argv[4];
+    std::wstring backup_dir = argv[5];
+    std::wstring lock_path = argv[6];
+    DWORD timeout_ms = (argc >= 8 && argv[7][0]) ? (DWORD)wcstoul(argv[7], nullptr, 10) : 15000;
+    bool do_relaunch = (argc >= 9) ? (wcscmp(argv[8], L"0") != 0) : true;
+
+    std::wstring err_marker = join_path(install_dir, L".PokeV-Recomp.update-error.txt");
+    std::wstring progress_marker = join_path(install_dir, L".PokeV-Recomp.update-in-progress");
+    std::wstring notice_marker = join_path(install_dir, L".PokeV-Recomp.update-notice.txt");
+    std::wstring staging_root = join_path(install_dir, L".update-staging");
+
+    auto fail_keep_backup = [&](const std::string &msg, int code) {
+        write_text_file(err_marker, msg);
+        DeleteFileW(to_long_win_path(lock_path).c_str());
+        return code;
+    };
+
+    // 1. Wait for main process to exit completely (inherited HANDLE prevents PID reuse)
+    if (!wait_for_parent_exit(pid, handle_val, timeout_ms)) {
+        return fail_keep_backup(
+            "Timed out waiting for PokeV-Recomp.exe to exit before recovering backup.", 1);
+    }
+
+    // 2. Verify backup directory exists and contains files
+    DWORD battr = GetFileAttributesW(to_long_win_path(backup_dir).c_str());
+    if (battr == INVALID_FILE_ATTRIBUTES || (battr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return fail_keep_backup(
+            "Recovery failed: .PokeV-Recomp.update.bak is missing. Please reinstall PokeV-Recomp.", 11);
+    }
+    std::vector<std::wstring> bak_files;
+    collect_relative_files(backup_dir, L"", bak_files);
+    if (bak_files.empty()) {
+        return fail_keep_backup(
+            "Recovery failed: .PokeV-Recomp.update.bak is empty. Please reinstall PokeV-Recomp.", 11);
+    }
+
+    // 3. Confirm target executables/DLLs are no longer locked (retry up to 5 seconds)
+    DWORD lock_wait_ms = 0;
+    bool all_unlocked = false;
+    while (lock_wait_ms <= 5000) {
+        all_unlocked = true;
+        for (const auto &rel : bak_files) {
+            if (!check_file_unlocked(join_path(install_dir, rel))) {
+                all_unlocked = false;
+                break;
+            }
+        }
+        if (all_unlocked) break;
+        Sleep(100);
+        lock_wait_ms += 100;
+    }
+    if (!all_unlocked) {
+        return fail_keep_backup(
+            "Recovery blocked: target files are still locked by another process. Close all instances and retry.", 3);
+    }
+
+    // 4. Restore every file from backup_dir -> install_dir (keep remaining backup files if any step fails)
+    for (const auto &rel : bak_files) {
+        if (!move_file_mkdir(join_path(backup_dir, rel), join_path(install_dir, rel))) {
+            return fail_keep_backup(
+                "Recovery failed while restoring " + wide_to_utf8(rel) +
+                    ". Backup preserved in .PokeV-Recomp.update.bak.",
+                5);
+        }
+    }
+
+    // 5. Validate critical files before clearing markers or relaunching
+    std::string missing_crit;
+    if (!validate_critical_install_files(install_dir, missing_crit)) {
+        return fail_keep_backup(
+            "Recovery validation failed (missing " + missing_crit +
+                "). Manual recovery or reinstallation is required.",
+            7);
+    }
+
+    // 6. Commit recovery: clear markers BEFORE relaunching to prevent any relaunch loop
+    DeleteFileW(to_long_win_path(err_marker).c_str());
+    DeleteFileW(to_long_win_path(progress_marker).c_str());
+    remove_tree_recursive(backup_dir);
+    remove_tree_recursive(staging_root);
+    DeleteFileW(to_long_win_path(lock_path).c_str());
+    write_text_file(notice_marker,
+                    "Previous update was interrupted and safely restored to the previous version.");
+
+    // 7. Relaunch verified installation
+    if (do_relaunch) {
+        relaunch_app(install_dir);
+    }
+    return 0;
+}
+
 int wmain(int argc, wchar_t **argv) {
+    if (argc >= 2 && wcscmp(argv[1], L"--recover") == 0) {
+        return run_recover_mode(argc, argv);
+    }
     if (argc < 10) return 10;
 
     DWORD pid = (DWORD)wcstoul(argv[1], nullptr, 10);
@@ -339,23 +493,13 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     // 6. Validate critical files in the new installation
-    static const wchar_t *const k_critical[] = {
-        L"PokeV-Recomp.exe",
-        L"za-default.ini",
-        L"recomplauncher.json",
-        L"gamelib-src\\gamelib_entry.c",
-        L"zaimport\\zaimport.exe",
-        L"zig\\zig.exe",
-        L"lasgen\\lasgen.exe",
-    };
-    for (const wchar_t *c : k_critical) {
-        if (!file_exists_nonempty(join_path(install_dir, c), true)) {
-            rollback();
-            write_text_file(err_marker,
-                            std::string("Updated installation failed validation (missing ") +
-                            wide_to_utf8(c) + "). Rolled back to previous version.");
-            return 7;
-        }
+    std::string missing_crit;
+    if (!validate_critical_install_files(install_dir, missing_crit)) {
+        rollback();
+        write_text_file(err_marker,
+                        "Updated installation failed validation (missing " +
+                        missing_crit + "). Rolled back to previous version.");
+        return 7;
     }
 
     // 7. Commit: write new app manifest, _updated.txt, and clean up backup/staging/lock
@@ -375,17 +519,7 @@ int wmain(int argc, wchar_t **argv) {
 
     // 8. Relaunch updated PokeV-Recomp.exe
     if (do_relaunch) {
-        std::wstring exe_path = join_path(install_dir, L"PokeV-Recomp.exe");
-        std::wstring cmd = L"\"" + exe_path + L"\"";
-        STARTUPINFOW si{};
-        si.cb = sizeof(si);
-        PROCESS_INFORMATION pi{};
-        if (CreateProcessW(exe_path.c_str(), cmd.data(), nullptr, nullptr, FALSE,
-                           DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
-                           nullptr, install_dir.c_str(), &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-        }
+        relaunch_app(install_dir);
     }
     return 0;
 }
