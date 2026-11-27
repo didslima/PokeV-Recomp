@@ -8,17 +8,22 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 exec_src = (root / 'runtime/nvn/vulkan/exec.c').read_text()
 tex_src = (root / 'runtime/nvn/vulkan/textures.c').read_text()
+vk_h_src = (root / 'runtime/nvn/vulkan/vk.h').read_text()
 ws_src = (root / 'runtime/hle/widescreen.c').read_text()
 
 vp_start = exec_src.index('// A draw into a reshaped pass centred to `src_aspect`')
 vp_end = exec_src.index('// A draw into a reshaped (wider / taller than 16:9) pass at the uniform scale')
 vp_aspect_code = exec_src[vp_start:vp_end]
 
-# Verify textures.c and movie.c wiring
+# Verify vk.h, textures.c, and exec.c wiring
+assert 'bool movie_boxed;' in vk_h_src
 assert 'b->is_movie = true;' in tex_src
 assert 'b->is_movie = false;' in tex_src
+assert 'b->movie_boxed = false;' in tex_src
 assert 'LARECOMP_WIDE_MOVIE_BOX' in exec_src
 assert 'movie_cpu_video_active' in exec_src
+assert 'full_movie_copy' in exec_src
+assert 'movie_box_rect(b->movie_w, b->movie_h' in exec_src
 
 harness = r'''
 #include <assert.h>
@@ -28,10 +33,13 @@ harness = r'''
 #include <stdio.h>
 #include <stdlib.h>
 
-typedef struct { uint32_t width, height; bool is_movie; uint32_t movie_w, movie_h; } FakeColor;
+typedef struct { uint32_t width, height; bool is_movie, movie_boxed; uint32_t movie_w, movie_h; } FakeColor;
+typedef FakeColor TexBackend;
 static struct {
     struct { FakeColor *color[1]; } rt;
 } st;
+
+#define ENV(name) getenv(name)
 
 typedef void *VkCommandBuffer;
 typedef enum { VK_FORMAT_UNDEFINED = 0, VK_FORMAT_R8G8B8A8_UNORM = 37 } VkFormat;
@@ -51,8 +59,17 @@ typedef struct {
 
 static struct {
     uint32_t ncolor, layers, movie_bar_w, movie_bar_h;
+    bool has_non_movie_draw;
     VkFormat color[1];
 } g_pass = { .ncolor = 1, .layers = 1, .color = { VK_FORMAT_R8G8B8A8_UNORM } };
+
+static bool g_cpu_active = false;
+static uint32_t g_cpu_w = 0, g_cpu_h = 0;
+bool movie_cpu_video_active(uint32_t *w, uint32_t *h) {
+    if (!g_cpu_active) return false;
+    *w = g_cpu_w; *h = g_cpu_h;
+    return true;
+}
 #define pass_cur() (&g_pass)
 #define pass_ncolor (g_pass.ncolor)
 #define pass_color (g_pass.color)
@@ -147,6 +164,100 @@ int main(void) {
     run_case(5120, 1440, 1920, 1080, 1920, 1080, 1280.0f, 0.0f, 2560.0f, 1440.0f);
     clear_movie_bars(NULL);
     assert(g_clear_calls == 2);
+
+    // 10. CPU fallback dimension matching (exact, 256/16 aligned, half-res chroma plane)
+    assert(movie_cpu_tex_match(1920, 1080, 1920, 1080));
+    assert(movie_cpu_tex_match(2048, 1088, 1920, 1080));
+    assert(movie_cpu_tex_match(960, 540, 1920, 1080));
+    assert(movie_cpu_tex_match(1024, 544, 1920, 1080));
+    assert(!movie_cpu_tex_match(800, 600, 1920, 1080));
+    assert(!movie_cpu_tex_match(1920, 1080, 1280, 720));
+
+    // 11. Direct vk_present_draw rect boxing
+    {
+        float vx = 0.0f, vy = 0.0f, vw = 5120.0f, vh = 1440.0f;
+        movie_box_rect(1920, 1080, &vx, &vy, &vw, &vh);
+        assert(NEAR(vx, 1280.0f) && NEAR(vy, 0.0f) && NEAR(vw, 2560.0f) && NEAR(vh, 1440.0f));
+
+        vx = 0.0f; vy = 0.0f; vw = 3440.0f; vh = 1440.0f;
+        movie_box_rect(1920, 1080, &vx, &vy, &vw, &vh);
+        assert(NEAR(vx, 440.0f) && NEAR(vy, 0.0f) && NEAR(vw, 2560.0f) && NEAR(vh, 1440.0f));
+
+        vx = 0.0f; vy = 0.0f; vw = 1920.0f; vh = 1080.0f;
+        movie_box_rect(1920, 1080, &vx, &vy, &vw, &vh);
+        assert(NEAR(vx, 0.0f) && NEAR(vy, 0.0f) && NEAR(vw, 1920.0f) && NEAR(vh, 1080.0f));
+    }
+
+    // 12. 1:1 intermediate RT -> reshaped composition -> second reshaped pass (no double boxing)
+    if (box_on) {
+        TexBackend dec = { .width = 1920, .height = 1080, .is_movie = true, .movie_boxed = false, .movie_w = 1920, .movie_h = 1080 };
+        TexBackend mid = { .width = 1920, .height = 1080 };
+        TexBackend sc  = { .width = 1920, .height = 1080 };
+        TexBackend sc2 = { .width = 1920, .height = 1080 };
+        TexBackend *srcs[1] = { &dec };
+        uint32_t wh[1][2] = { { 1920, 1080 } };
+
+        // Pass 1 (1:1): YUV->RGBA / filter pass propagates is_movie (movie_boxed stays false)
+        g_pass.has_non_movie_draw = false;
+        g_pass.movie_bar_w = g_pass.movie_bar_h = 0;
+        g_pw = 1920; g_ph = 1080;
+        pass_sx = 1.0f; pass_sy = 1.0f; vp_sx = 1.0f; vp_sy = 1.0f; vp_ox = 0.0f; vp_oy = 0.0f;
+        st.rt.color[0] = &mid;
+        bool boxed1 = movie_draw_apply(NULL, &mid, 1, 1, srcs, wh, true, false);
+        assert(!boxed1 && mid.is_movie && !mid.movie_boxed && mid.movie_w == 1920 && mid.movie_h == 1080);
+
+        // Pass 2 (reshaped 32:9): sampling mid applies boxing + bars and sets sc.movie_boxed = true
+        g_pass.has_non_movie_draw = false;
+        g_pass.movie_bar_w = g_pass.movie_bar_h = 0;
+        g_clear_calls = 0;
+        g_pw = 5120; g_ph = 1440;
+        pass_sx = 5120.0f / 1920.0f; pass_sy = 1440.0f / 1080.0f;
+        vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0.0f; vp_oy = 0.0f;
+        st.rt.color[0] = &sc;
+        srcs[0] = &mid;
+        bool boxed2 = movie_draw_apply(NULL, &sc, 1, 1, srcs, wh, true, true);
+        assert(boxed2 && g_clear_calls == 1 && NEAR(vp_ox, 1280.0f) && sc.is_movie && sc.movie_boxed);
+
+        // Pass 3 (reshaped 32:9 sampling already-boxed sc): skips vp_box_aspect and clear_movie_bars, returns true
+        g_pass.has_non_movie_draw = false;
+        g_pass.movie_bar_w = g_pass.movie_bar_h = 0;
+        g_clear_calls = 0;
+        vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0.0f; vp_oy = 0.0f;
+        st.rt.color[0] = &sc2;
+        srcs[0] = &sc;
+        bool boxed3 = movie_draw_apply(NULL, &sc2, 1, 1, srcs, wh, true, true);
+        assert(boxed3 && g_clear_calls == 0 && vp_ox == 0.0f && NEAR(vp_sx, pass_sx) && sc2.movie_boxed);
+
+        // 13. Mixing non-movie draw onto unboxed movie RT clears is_movie; mixed pass won't re-mark
+        g_pass.has_non_movie_draw = false;
+        TexBackend ui_tex = { .width = 512, .height = 512, .is_movie = false };
+        TexBackend *ui_srcs[1] = { &ui_tex };
+        uint32_t ui_wh[1][2] = { { 512, 512 } };
+        assert(!movie_draw_apply(NULL, &mid, 1, 1, ui_srcs, ui_wh, true, false));
+        assert(!mid.is_movie && g_pass.has_non_movie_draw);
+        srcs[0] = &dec;
+        assert(!movie_draw_apply(NULL, &mid, 1, 1, srcs, wh, true, false));
+        assert(!mid.is_movie);
+
+        // 14. CPU fallback requires both active decoder AND video_draw_ok
+        g_pass.has_non_movie_draw = false;
+        g_cpu_active = true; g_cpu_w = 1920; g_cpu_h = 1080;
+        TexBackend cpu_tex = { .width = 2048, .height = 1088, .is_movie = false };
+        TexBackend *cpu_srcs[1] = { &cpu_tex };
+        uint32_t cpu_wh[1][2] = { { 2048, 1088 } };
+        TexBackend cpu_rt = { .width = 1920, .height = 1080 };
+        st.rt.color[0] = &cpu_rt;
+        // video_draw_ok = false (e.g. 3D depth-tested draw or small UI quad) must NOT match CPU fallback
+        assert(!movie_draw_apply(NULL, &cpu_rt, 1, 1, cpu_srcs, cpu_wh, false, true));
+        assert(!cpu_rt.is_movie);
+        // video_draw_ok = true with fresh pass matches aligned CPU texture
+        g_pass.has_non_movie_draw = false;
+        g_pass.movie_bar_w = g_pass.movie_bar_h = 0;
+        vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0.0f; vp_oy = 0.0f;
+        assert(movie_draw_apply(NULL, &cpu_rt, 1, 1, cpu_srcs, cpu_wh, true, true));
+        assert(cpu_rt.is_movie && cpu_rt.movie_boxed && NEAR(vp_ox, 1280.0f));
+        g_cpu_active = false;
+    }
 
     printf("PASS: movie aspect-ratio boxing tests\n");
     return 0;

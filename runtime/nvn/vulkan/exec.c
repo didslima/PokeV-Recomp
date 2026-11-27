@@ -1648,7 +1648,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 // The pass's attachments, size and scale (begin_pass). Per thread: an async run's workers draw with their pass's while
 // the render thread begins the next ones (sw_async_*: pass_tls is the job's copy).
-typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers, movie_bar_w, movie_bar_h; } PassG;
+typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers, movie_bar_w, movie_bar_h; bool has_non_movie_draw; } PassG;
 static PassG pass_main = {.sx = 1, .sy = 1, .samples = 1, .layers = 1};
 static __thread PassG *pass_tls;
 static inline PassG *pass_cur(void) { PassG *p = pass_tls; return p ? p : &pass_main; }
@@ -1964,6 +1964,7 @@ static void begin_pass_(void) {
     }
     pass_cur()->movie_bar_w = 0;
     pass_cur()->movie_bar_h = 0;
+    pass_cur()->has_non_movie_draw = false;
     // A pass with depth / stencil but no color attachment gets a throwaway one on Intel (LARECOMP_VK_PLACEHOLDER_COLOR=0 /
     // 1 overrides): the UHD 630's Windows driver (Vulkan 1.3.215) crashes in the vkCmdBeginRendering after such a pass,
     // reading near a null pointer (issues #8, #46). Pipelines and clears follow pass_ncolor / pass_color as usual.
@@ -2278,6 +2279,7 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
                   uint32_t smask) {
     begin_pass();
     pass_cur()->movie_bar_w = pass_cur()->movie_bar_h = 0;
+    pass_cur()->has_non_movie_draw = false;
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
@@ -8013,6 +8015,87 @@ static void clear_movie_bars(VkCommandBuffer cb) {
                             .clearValue.color.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
     rec_CmdClearAttachments(cb, 1, &ca, n, rects);
 }
+static bool movie_box_enabled(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = ENV("LARECOMP_WIDE_MOVIE_BOX"); on = !e || atoi(e) != 0; }
+    return on != 0;
+}
+// Match CPU-fallback video planes (exact, hardware-aligned luma/RGBA, or half-res chroma plane).
+static bool movie_cpu_tex_match(uint32_t w, uint32_t h, uint32_t cpu_mw, uint32_t cpu_mh) {
+    if (!w || !h || !cpu_mw || !cpu_mh) return false;
+    uint32_t aw = (cpu_mw + 255u) & ~255u, ah = (cpu_mh + 15u) & ~15u;
+    if (w >= cpu_mw && w <= aw && h >= cpu_mh && h <= ah) return true;
+    uint32_t cw = cpu_mw / 2, ch = cpu_mh / 2;
+    if (cw && ch) {
+        uint32_t acw = (cw + 255u) & ~255u, ach = (ch + 15u) & ~15u;
+        if (w >= cw && w <= acw && h >= ch && h <= ach) return true;
+    }
+    return false;
+}
+// Box a viewport/rect (vx, vy, vw, vh) to `movie_w / movie_h` when its aspect differs (e.g. direct swapchain present).
+static void movie_box_rect(uint32_t movie_w, uint32_t movie_h, float *vx, float *vy, float *vw, float *vh) {
+    if (!movie_w || !movie_h || !(*vw > 0.0f) || !(*vh > 0.0f)) return;
+    float movie_aspect = (float)movie_w / (float)movie_h;
+    float dst_aspect = *vw / *vh;
+    if (fabsf(dst_aspect - movie_aspect) <= 0.01f * movie_aspect) return;
+    if (dst_aspect > movie_aspect) {
+        float bw = *vh * movie_aspect;
+        *vx += (*vw - bw) * 0.5f;
+        *vw = bw;
+    } else {
+        float bh = *vw / movie_aspect;
+        *vy += (*vh - bh) * 0.5f;
+        *vh = bh;
+    }
+}
+// Identify pre-rendered video draws, apply aspect-ratio boxing on reshaped passes, and propagate metadata only for clean
+// fullscreen 1:1 passes (never mixing video with gameplay/UI). Returns true when the draw is a movie draw in a reshaped pass.
+static bool movie_draw_apply(VkCommandBuffer cb, TexBackend *rt0, uint32_t ncolor, int ntex, TexBackend *const *tbs,
+                             const uint32_t (*wh)[2], bool video_draw_ok, bool reshaped) {
+    if (!movie_box_enabled() || !ncolor) return false;
+    bool found = false, src_boxed = false;
+    uint32_t mw = 0, mh = 0;
+    for (int i = 0; i < ntex && i < 64; i++) {
+        const TexBackend *b = tbs[i];
+        if (b && b->is_movie && b->movie_w > 0 && b->movie_h > 0) {
+            found = true; mw = b->movie_w; mh = b->movie_h; src_boxed = b->movie_boxed;
+            break;
+        }
+    }
+    if (!found && video_draw_ok) {
+        extern bool movie_cpu_video_active(uint32_t *w, uint32_t *h);
+        uint32_t cpu_mw = 0, cpu_mh = 0;
+        if (movie_cpu_video_active(&cpu_mw, &cpu_mh)) {
+            for (int i = 0; i < ntex && i < 64; i++) {
+                if (movie_cpu_tex_match(wh[i][0], wh[i][1], cpu_mw, cpu_mh)) {
+                    found = true; mw = cpu_mw; mh = cpu_mh; src_boxed = false;
+                    break;
+                }
+            }
+        }
+    }
+    if (!found) {
+        pass_cur()->has_non_movie_draw = true;
+        if (rt0 && rt0->is_movie && !rt0->movie_boxed) {
+            rt0->is_movie = false; rt0->movie_boxed = false; rt0->movie_w = rt0->movie_h = 0;
+        }
+        return false;
+    }
+    if (reshaped) {
+        if (!src_boxed) {
+            vp_box_aspect((float)mw / (float)mh);
+            clear_movie_bars(cb);
+        }
+        if (rt0 && (!pass_cur()->has_non_movie_draw || !src_boxed)) {
+            rt0->is_movie = true; rt0->movie_boxed = true; rt0->movie_w = mw; rt0->movie_h = mh;
+        }
+        return true;
+    }
+    if (rt0 && ncolor == 1 && video_draw_ok && !pass_cur()->has_non_movie_draw) {
+        rt0->is_movie = true; rt0->movie_boxed = src_boxed; rt0->movie_w = mw; rt0->movie_h = mh;
+    }
+    return false;
+}
 // A draw into a reshaped (wider / taller than 16:9) pass at the uniform scale, centred: UI keeps its 16:9 layout.
 static void vp_box_16_9(void) {
     int pw, ph;
@@ -8477,33 +8560,20 @@ static void draw_(CmdRec *r, bool indexed) {
 #undef FTEX
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
     bool movie_boxed = false;
-    static int movie_box_on = -1;
-    if (movie_box_on < 0) { const char *e = ENV("LARECOMP_WIDE_MOVIE_BOX"); movie_box_on = !e || atoi(e) != 0; }
-    if (movie_box_on && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor) {
-        for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+    if (st.rt.ncolor && st.rt.color[0]) {
+        TexBackend *ftbs[64];
+        int ntex = pr->fi->ntex < 64 ? pr->fi->ntex : 64;
+        for (int i = 0; i < ntex; i++) {
             NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
-            const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
-            if (b && b->is_movie && b->movie_w > 0 && b->movie_h > 0) {
-                vp_box_aspect((float)b->movie_w / (float)b->movie_h);
-                clear_movie_bars(cb);
-                movie_boxed = true;
-                break;
-            }
+            ftbs[i] = t ? (TexBackend *)t->backend : NULL;
         }
-        if (!movie_boxed) {
-            extern bool movie_cpu_video_active(uint32_t *w, uint32_t *h);
-            uint32_t cpu_mw = 0, cpu_mh = 0;
-            if (movie_cpu_video_active(&cpu_mw, &cpu_mh)) {
-                for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
-                    if (tex_wh[1][i][0] == cpu_mw && tex_wh[1][i][1] == cpu_mh) {
-                        vp_box_aspect((float)cpu_mw / (float)cpu_mh);
-                        clear_movie_bars(cb);
-                        movie_boxed = true;
-                        break;
-                    }
-                }
-            }
-        }
+        bool depth_test = st.ds[0] && st.rt.depth && compare_fn(st.ds[2]) != VK_COMPARE_OP_ALWAYS;
+        bool video_draw_ok = r->x[2] <= 6 && !depth_test && st.viewport[0][0] <= 1.0f && st.viewport[0][1] <= 1.0f &&
+                             st.viewport[0][2] >= (float)st.rt.color[0]->width * 0.99f &&
+                             st.viewport[0][3] >= (float)st.rt.color[0]->height * 0.99f;
+        bool reshaped = fabsf(pass_sx - pass_sy) > 0.01f * pass_sy;
+        movie_boxed = movie_draw_apply(cb, (TexBackend *)st.rt.color[0]->backend, st.rt.ncolor, ntex, ftbs, tex_wh[1],
+                                       video_draw_ok, reshaped);
     }
     if (!movie_boxed && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
@@ -9377,6 +9447,7 @@ static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_
     uint32_t sly = src->has_view && (src->view.setmask & 2) ? src->view.min_layer : 0;
     uint32_t dly = dst->has_view && (dst->view.setmask & 2) ? dst->view.min_layer : 0;
     if (slv >= s->levels || dlv >= d->levels || sly >= s->layers || dly >= d->layers) return;
+    bool full_movie_copy = false;
     {   // whole-image regions are the contents' extent in the level, and every region stays inside its level: scaled
         // allocations (internal resolution below 1x) round guest regions past the edge, and out-of-bounds copies /
         // blits are undefined in Vulkan (garbage that changed every frame on NVIDIA: flicker in the depth pyramid's
@@ -9399,12 +9470,23 @@ static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_
         if (dx0 + dw > dlw) dw = dlw - dx0;
         if (dy0 + dh > dlh) dh = dlh - dy0;
         if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+        full_movie_copy = slv == 0 && dlv == 0 && sly == 0 && dly == 0 && sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 &&
+                          sw >= scw && sh >= sch && dw >= dcw && dh >= dch;
     }
     if (g_debug_frame || ct_on())
         LOG("[copytex] %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] -> %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] phys (%d,%d %dx%d) -> (%d,%d %dx%d) flags %llx\n",
             (void *)st_, st_->width, st_->height, st_->format, slv, sr[0], sr[1], sr[3], sr[4], s->width, s->height, (void *)dt, dt->width,
             dt->height, dt->format, dlv, dr[0], dr[1], dr[3], dr[4], d->width, d->height, sx0, sy0, sw, sh, dx0, dy0, dw, dh,
             (unsigned long long)flags);
+    if (full_movie_copy) {
+        const TexBackend *ms = naliases ? (const TexBackend *)alias_read(st_)->backend : s;
+        if (ms && ms->is_movie && ms->movie_w > 0 && ms->movie_h > 0) {
+            d->is_movie = true;
+            d->movie_boxed = ms->movie_boxed;
+            d->movie_w = ms->movie_w;
+            d->movie_h = ms->movie_h;
+        }
+    }
     if (copy_opt() && sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 && sw == (int)s->width && sh == (int)s->height && dw == (int)d->width &&
         dh == (int)d->height && slv == 0 && dlv == 0 && sly == 0 && dly == 0 && alias_make(st_, dt, s, d)) {
         if (ct_on()) LOG("[ct] alias made %p -> %p\n", (void *)st_, (void *)dt);
@@ -11415,6 +11497,10 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, float fx, flo
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
 void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    // Direct presentation of an unboxed movie texture: centre to native aspect on the swapchain (already cleared black
+    // by vk_frame_begin in device.c).
+    if (movie_box_enabled() && b->is_movie && !b->movie_boxed && b->movie_w > 0 && b->movie_h > 0)
+        movie_box_rect(b->movie_w, b->movie_h, &vx, &vy, &vw, &vh);
     // Dynamic: the image occupies the top-left part of the texture; FSR maps that part to its whole output, otherwise
     // the present samples the part
     float fx = b->scalable && b->ax > 0 ? b->sx / b->ax : 1, fy = b->scalable && b->ay > 0 ? b->sy / b->ay : 1;
