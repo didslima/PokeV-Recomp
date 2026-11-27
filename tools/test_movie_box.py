@@ -259,6 +259,38 @@ int main(void) {
         g_cpu_active = false;
     }
 
+    // 15. movie_copy_is_full: full copy, partial copy, differing dims, aliases, layers, mip levels
+    {
+        // Full base-level/layer copy (1920x1080 -> 1920x1080)
+        assert(movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1920, 1080, 1920, 1080, 1920, 1080, 1920, 1080));
+        // Full copy with differing src/dst content dimensions (e.g. 1920x1080 -> 1280x720 or 2560x1440)
+        assert(movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1920, 1080, 1280, 720, 1920, 1080, 1280, 720));
+        assert(movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1920, 1080, 2560, 1440, 1920, 1080, 2560, 1440));
+        // Partial copies: non-zero offsets or smaller region than content extent
+        assert(!movie_copy_is_full(0, 0, 0, 0, 16, 0, 0, 0, 1904, 1080, 1904, 1080, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_is_full(0, 0, 0, 0, 0, 16, 0, 0, 1920, 1064, 1920, 1064, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_is_full(0, 0, 0, 0, 0, 0, 8, 0, 1920, 1080, 1912, 1080, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 8, 1920, 1080, 1920, 1072, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1280, 720, 1280, 720, 1920, 1080, 1920, 1080));
+        // Destination larger than copied region (e.g. 1920x1080 into padded 2048x1088) must NOT propagate
+        assert(!movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1920, 1080, 1920, 1080, 1920, 1080, 2048, 1088));
+        // Mip levels and array layers != 0 must NOT propagate
+        assert(!movie_copy_is_full(1, 0, 0, 0, 0, 0, 0, 0, 960, 540, 960, 540, 960, 540, 960, 540));
+        assert(!movie_copy_is_full(0, 1, 0, 0, 0, 0, 0, 0, 960, 540, 960, 540, 960, 540, 960, 540));
+        assert(!movie_copy_is_full(0, 0, 1, 0, 0, 0, 0, 0, 1920, 1080, 1920, 1080, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_is_full(0, 0, 0, 1, 0, 0, 0, 0, 1920, 1080, 1920, 1080, 1920, 1080, 1920, 1080));
+        // Alias simulation: whole-image copy from alias backend propagates movie state without losing movie_boxed
+        TexBackend alias_src = { .width = 1920, .height = 1080, .is_movie = true, .movie_boxed = true, .movie_w = 1920, .movie_h = 1080 };
+        TexBackend alias_dst = { .width = 1920, .height = 1080 };
+        if (movie_copy_is_full(0, 0, 0, 0, 0, 0, 0, 0, 1920, 1080, 1920, 1080, 1920, 1080, 1920, 1080)) {
+            alias_dst.is_movie = alias_src.is_movie;
+            alias_dst.movie_boxed = alias_src.movie_boxed;
+            alias_dst.movie_w = alias_src.movie_w;
+            alias_dst.movie_h = alias_src.movie_h;
+        }
+        assert(alias_dst.is_movie && alias_dst.movie_boxed && alias_dst.movie_w == 1920 && alias_dst.movie_h == 1080);
+    }
+
     printf("PASS: movie aspect-ratio boxing tests\n");
     return 0;
 }

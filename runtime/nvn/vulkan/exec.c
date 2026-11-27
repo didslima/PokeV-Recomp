@@ -8096,6 +8096,15 @@ static bool movie_draw_apply(VkCommandBuffer cb, TexBackend *rt0, uint32_t ncolo
     }
     return false;
 }
+// True only for whole-content base-level/layer copies in copy_texture_gpu (partial/mip/layer copies never propagate movie state).
+static bool movie_copy_is_full(uint32_t slv, uint32_t dlv, uint32_t sly, uint32_t dly,
+                               int sx0, int sy0, int dx0, int dy0,
+                               int sw, int sh, int dw, int dh,
+                               int scw, int sch, int dcw, int dch) {
+    return slv == 0 && dlv == 0 && sly == 0 && dly == 0 &&
+           sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 &&
+           sw >= scw && sh >= sch && dw >= dcw && dh >= dch;
+}
 // A draw into a reshaped (wider / taller than 16:9) pass at the uniform scale, centred: UI keeps its 16:9 layout.
 static void vp_box_16_9(void) {
     int pw, ph;
@@ -8570,7 +8579,7 @@ static void draw_(CmdRec *r, bool indexed) {
         bool depth_test = st.ds[0] && st.rt.depth && compare_fn(st.ds[2]) != VK_COMPARE_OP_ALWAYS;
         bool video_draw_ok = r->x[2] <= 6 && !depth_test && st.viewport[0][0] <= 1.0f && st.viewport[0][1] <= 1.0f &&
                              st.viewport[0][2] >= (float)st.rt.color[0]->width * 0.99f &&
-                             st.viewport[0][3] >= (float)st.rt.color[0]->height * 0.99f;
+                             fabsf(st.viewport[0][3]) >= (float)st.rt.color[0]->height * 0.99f;
         bool reshaped = fabsf(pass_sx - pass_sy) > 0.01f * pass_sy;
         movie_boxed = movie_draw_apply(cb, (TexBackend *)st.rt.color[0]->backend, st.rt.ncolor, ntex, ftbs, tex_wh[1],
                                        video_draw_ok, reshaped);
@@ -9470,8 +9479,7 @@ static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_
         if (dx0 + dw > dlw) dw = dlw - dx0;
         if (dy0 + dh > dlh) dh = dlh - dy0;
         if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
-        full_movie_copy = slv == 0 && dlv == 0 && sly == 0 && dly == 0 && sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 &&
-                          sw >= scw && sh >= sch && dw >= dcw && dh >= dch;
+        full_movie_copy = movie_copy_is_full(slv, dlv, sly, dly, sx0, sy0, dx0, dy0, sw, sh, dw, dh, scw, sch, dcw, dch);
     }
     if (g_debug_frame || ct_on())
         LOG("[copytex] %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] -> %p %ux%u f%#x lv%u (%d,%d %dx%d) [%ux%u] phys (%d,%d %dx%d) -> (%d,%d %dx%d) flags %llx\n",

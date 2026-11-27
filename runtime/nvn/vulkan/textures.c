@@ -563,6 +563,9 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         if (b->scalable && (b->ax != g_al_x || b->ay != g_al_y)) {  // output resolution changed: reallocate
+            b->is_movie = false;
+            b->movie_boxed = false;
+            b->movie_w = b->movie_h = 0;
             destroy_image(b);
             create_image(t, b);
         }
@@ -929,6 +932,7 @@ static void upload_pending(TexBackend *b) {
     pthread_mutex_unlock(&pending_lock);
     if (!px) return;
     b->is_movie = true;
+    b->movie_boxed = false;
     b->movie_w = w;
     b->movie_h = h;
     if (nv12) { vk_convert_nv12(b, px, w, h, stride, uv_off); free(px); return; }
