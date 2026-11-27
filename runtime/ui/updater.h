@@ -59,6 +59,9 @@ struct UpdaterSnapshot {
     uint64_t total_bytes = 0;
     std::string install_error;
     std::string updated_from_tag;  // non-empty when this launch follows a completed update
+    bool recovery_pending = false; // interrupted Windows update needs external --recover before continuing
+    bool recovery_blocked = false; // Play must remain blocked due to pending or failed recovery
+    std::string update_notice;     // non-empty informational notice after automatic recovery
 };
 
 // Pure helpers (also used by unit tests)
@@ -137,10 +140,12 @@ void updater_configure(const char *current_version, const char *data_root,
 bool updater_is_suppressed_by_launcher();
 void updater_start_check(bool manual);
 
-// Phase B: Linux AppImage download, SHA-256 verification, cancel, and external apply+relaunch
+// Phase B / C: Download, SHA-256 verification, cancel, external apply+relaunch & Windows recovery
 void updater_start_install();
 void updater_cancel_install();
 bool updater_launch_external_apply_and_exit_ready();
+bool updater_is_recovery_blocked();
+bool updater_launch_windows_recovery_and_exit_ready();
 
 void updater_shutdown();
 UpdaterSnapshot updater_get_snapshot();

@@ -64,6 +64,7 @@ static std::string g_staged_path;
 static std::string g_manifest_path;
 static std::string g_backup_path;
 static std::string g_lock_path;
+static std::string g_recovery_dir;
 
 long long updater_tag_rank(const std::string &tag) {
     int n = 0;
@@ -778,55 +779,73 @@ static void cleanup_on_boot_locked(const std::string &data_root, const std::stri
         fs::path bak_dir = dir / ".PokeV-Recomp.update.bak";
         fs::path prog_marker = dir / ".PokeV-Recomp.update-in-progress";
         fs::path err_marker = dir / ".PokeV-Recomp.update-error.txt";
+        fs::path notice_marker = dir / ".PokeV-Recomp.update-notice.txt";
         fs::path exe_p = dir / "PokeV-Recomp.exe";
 
-        // Interrupted replacement (reboot/crash): restore from backup directory if needed
-        bool recovery_incomplete = false;
-        if (fs::is_directory(bak_dir, ec)) {
-            if (fs::exists(prog_marker, ec) || !fs::exists(exe_p, ec)) {
-                std::vector<fs::path> bak_files;
-                for (const auto &ent : fs::recursive_directory_iterator(bak_dir, ec)) {
-                    if (ent.is_regular_file(ec)) bak_files.push_back(ent.path());
-                }
-                bool all_restored = !ec;
-                for (const auto &src_p : bak_files) {
-                    fs::path rel = fs::relative(src_p, bak_dir, ec);
-                    if (ec || rel.empty()) {
-                        all_restored = false;
-                        continue;
-                    }
-                    fs::path dst = dir / rel;
-                    fs::create_directories(dst.parent_path(), ec);
-                    if (ec) {
-                        all_restored = false;
-                        continue;
-                    }
-                    if (!MoveFileExW(src_p.wstring().c_str(), dst.wstring().c_str(),
-                                     MOVEFILE_REPLACE_EXISTING)) {
-                        all_restored = false;
-                    }
-                }
-                if (all_restored) {
-                    fs::remove(prog_marker, ec);
-                    fs::remove_all(bak_dir, ec);
-                } else {
-                    recovery_incomplete = true;
-                    g_snap.install_state = UPD_INST_FAILED;
-                    g_snap.install_error =
-                        "Update recovery incomplete: some files in .PokeV-Recomp.update.bak could not be restored "
-                        "(files may still be in use). Close all instances and restart, or restore manually from .PokeV-Recomp.update.bak.";
-                }
-            } else {
-                fs::remove_all(bak_dir, ec);
+        auto critical_files_ok = [&]() -> bool {
+            static const char *const k_crit[] = {
+                "PokeV-Recomp.exe", "za-default.ini", "recomplauncher.json",
+                "gamelib-src/gamelib_entry.c", "zaimport/zaimport.exe",
+                "zig/zig.exe", "lasgen/lasgen.exe",
+            };
+            for (const char *c : k_crit) {
+                fs::path p = dir / fs::u8path(c);
+                if (!fs::is_regular_file(p, ec) || fs::file_size(p, ec) == 0 || ec) return false;
             }
-        } else {
-            fs::remove(prog_marker, ec);
+            return true;
+        };
+
+        bool bak_has_files = false;
+        if (fs::is_directory(bak_dir, ec)) {
+            for (const auto &ent : fs::recursive_directory_iterator(bak_dir, ec)) {
+                if (ent.is_regular_file(ec)) {
+                    bak_has_files = true;
+                    break;
+                }
+            }
         }
 
-        if (!recovery_incomplete && fs::is_regular_file(err_marker, ec)) {
+        // Interrupted update detection: NEVER restore EXE/DLLs in-process (they may be locked/loaded).
+        // Flag recovery_pending so launcher delegates restoration to PokeV-Recomp-updater.exe --recover.
+        if (bak_has_files && (fs::exists(prog_marker, ec) || !fs::exists(exe_p, ec) || !critical_files_ok())) {
+            g_snap.recovery_pending = true;
+            g_snap.recovery_blocked = true;
+            g_recovery_dir = dir.u8string();
+            g_snap.install_state = UPD_INST_FAILED;
+            g_snap.install_error =
+                "Previous update was interrupted and must be restored before starting.";
+        } else if (fs::exists(prog_marker, ec)) {
+            // Inconsistent state: progress marker without usable backup
+            if (!critical_files_ok()) {
+                g_snap.recovery_blocked = true;
+                g_snap.install_state = UPD_INST_FAILED;
+                g_snap.install_error =
+                    "Previous update was interrupted and backup is missing or empty. "
+                    "Please reinstall PokeV-Recomp (saves and settings are preserved).";
+            } else {
+                fs::remove(prog_marker, ec);
+                if (fs::is_directory(bak_dir, ec)) fs::remove_all(bak_dir, ec);
+                g_snap.update_notice =
+                    "A previous interrupted update made no changes; installation integrity verified.";
+            }
+        } else if (fs::is_directory(bak_dir, ec)) {
+            fs::remove_all(bak_dir, ec);
+        }
+
+        if (fs::is_regular_file(notice_marker, ec)) {
+            std::string notice = read_file_capped(notice_marker.u8string(), 1024);
+            while (!notice.empty() && (notice.back() == '\n' || notice.back() == '\r')) notice.pop_back();
+            if (!notice.empty()) g_snap.update_notice = notice;
+            fs::remove(notice_marker, ec);
+        }
+
+        if (!g_snap.recovery_pending && fs::is_regular_file(err_marker, ec)) {
             std::string prev_err = read_file_capped(err_marker.u8string(), 1024);
             while (!prev_err.empty() && (prev_err.back() == '\n' || prev_err.back() == '\r')) prev_err.pop_back();
-            if (!prev_err.empty()) g_snap.install_error = prev_err;
+            if (!prev_err.empty()) {
+                g_snap.install_error = prev_err;
+                g_snap.install_state = UPD_INST_FAILED;
+            }
             fs::remove(err_marker, ec);
         }
 
@@ -922,9 +941,13 @@ void updater_configure(const char *current_version, const char *data_root,
     g_snap.install_state = UPD_INST_IDLE;
     g_snap.install_error.clear();
     g_snap.updated_from_tag.clear();
+    g_snap.recovery_pending = false;
+    g_snap.recovery_blocked = false;
+    g_snap.update_notice.clear();
+    g_recovery_dir.clear();
     cleanup_on_boot_locked(g_data_root, recovery_tgt);
-    if (tgt.empty() && !recovery_tgt.empty()) {
-        // Re-detect in case boot recovery restored the AppImage/EXE from .bak
+    if (!g_snap.recovery_pending && !g_snap.recovery_blocked && tgt.empty() && !recovery_tgt.empty()) {
+        // Re-detect if boot recovery cleared stale markers
         g_snap.install_kind = updater_detect_install_kind(tgt, reason);
     }
     g_snap.install_target_path = tgt;
@@ -1720,6 +1743,169 @@ void updater_cancel_install() {
     g_cancel_install = true;
 }
 
+#ifdef _WIN32
+static std::wstring quote_win_arg(const std::wstring &a) {
+    std::wstring out = L"\"";
+    size_t bs = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') {
+            ++bs;
+        } else if (c == L'"') {
+            out.append(bs * 2 + 1, L'\\');
+            out.push_back(L'"');
+            bs = 0;
+        } else {
+            out.append(bs, L'\\');
+            out.push_back(c);
+            bs = 0;
+        }
+    }
+    out.append(bs * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+static bool spawn_win_updater_helper(const fs::path &dir, const fs::path &src_helper,
+                                     bool recover_mode, const std::vector<std::wstring> &tail_args,
+                                     std::string &out_err) {
+    std::error_code ec;
+    fs::path tmp_helper = dir / ".PokeV-Recomp.updater.tmp.exe";
+    if (!fs::copy_file(src_helper, tmp_helper, fs::copy_options::overwrite_existing, ec)) {
+        out_err = "Failed to stage Windows update helper executable.";
+        return false;
+    }
+
+    HANDLE hParentInherit = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                         &hParentInherit, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        fs::remove(tmp_helper, ec);
+        out_err = "Failed to duplicate process handle for Windows update helper.";
+        return false;
+    }
+
+    std::wstring cmd = quote_win_arg(tmp_helper.wstring());
+    if (recover_mode) cmd += L" --recover";
+    cmd += L" " + std::to_wstring((unsigned long)GetCurrentProcessId()) +
+           L" " + std::to_wstring((unsigned long long)(uintptr_t)hParentInherit);
+    for (const auto &a : tail_args) {
+        cmd += L" " + quote_win_arg(a);
+    }
+
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    if (attr_size == 0) {
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        out_err = "Failed to size Windows process attribute list.";
+        return false;
+    }
+    std::vector<uint8_t> attr_buf(attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+    if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        out_err = "Failed to initialize Windows process attribute list.";
+        return false;
+    }
+    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   &hParentInherit, sizeof(HANDLE), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(attr_list);
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        out_err = "Failed to bind inherited handle list for Windows update helper.";
+        return false;
+    }
+
+    STARTUPINFOEXW siex{};
+    siex.StartupInfo.cb = sizeof(siex);
+    siex.lpAttributeList = attr_list;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(tmp_helper.wstring().c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW |
+                                 EXTENDED_STARTUPINFO_PRESENT,
+                             nullptr, dir.wstring().c_str(), &siex.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(attr_list);
+    CloseHandle(hParentInherit);
+    if (!ok) {
+        fs::remove(tmp_helper, ec);
+        out_err = "Failed to launch Windows update helper process.";
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+#endif
+
+bool updater_is_recovery_blocked() {
+    pthread_mutex_lock(&g_upd_lock);
+    bool b = g_snap.recovery_blocked || g_snap.recovery_pending;
+    pthread_mutex_unlock(&g_upd_lock);
+    return b;
+}
+
+bool updater_launch_windows_recovery_and_exit_ready() {
+#ifdef _WIN32
+    pthread_mutex_lock(&g_upd_lock);
+    bool pending = g_snap.recovery_pending;
+    std::string rec_dir = g_recovery_dir;
+    pthread_mutex_unlock(&g_upd_lock);
+
+    if (!pending || rec_dir.empty()) return false;
+
+    std::error_code ec;
+    fs::path dir = fs::u8path(rec_dir);
+    fs::path bak_dir = dir / ".PokeV-Recomp.update.bak";
+    fs::path lock_p = dir / ".PokeV-Recomp.update.lock";
+
+    // Prefer trusted helper in install_dir, falling back to the backed-up helper in .update.bak
+    fs::path src_helper = dir / "PokeV-Recomp-updater.exe";
+    if (!fs::is_regular_file(src_helper, ec) || fs::file_size(src_helper, ec) == 0) {
+        fs::path bak_helper = bak_dir / "PokeV-Recomp-updater.exe";
+        if (fs::is_regular_file(bak_helper, ec) && fs::file_size(bak_helper, ec) > 0) {
+            src_helper = bak_helper;
+        } else {
+            pthread_mutex_lock(&g_upd_lock);
+            g_snap.recovery_pending = false;
+            g_snap.recovery_blocked = true;
+            g_snap.install_state = UPD_INST_FAILED;
+            g_snap.install_error =
+                "Recovery helper PokeV-Recomp-updater.exe is missing. "
+                "Restore files manually from .PokeV-Recomp.update.bak or reinstall.";
+            pthread_mutex_unlock(&g_upd_lock);
+            return false;
+        }
+    }
+
+    std::vector<std::wstring> args = {
+        dir.wstring(),
+        bak_dir.wstring(),
+        lock_p.wstring(),
+        L"15000",
+        L"1",
+    };
+    std::string err;
+    if (!spawn_win_updater_helper(dir, src_helper, true, args, err)) {
+        pthread_mutex_lock(&g_upd_lock);
+        g_snap.recovery_pending = false;
+        g_snap.recovery_blocked = true;
+        g_snap.install_state = UPD_INST_FAILED;
+        g_snap.install_error =
+            err + " Restore files manually from .PokeV-Recomp.update.bak or reinstall.";
+        pthread_mutex_unlock(&g_upd_lock);
+        return false;
+    }
+
+    pthread_mutex_lock(&g_upd_lock);
+    g_snap.install_state = UPD_INST_APPLYING;
+    pthread_mutex_unlock(&g_upd_lock);
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool updater_launch_external_apply_and_exit_ready() {
 #ifdef _WIN32
     pthread_mutex_lock(&g_upd_lock);
@@ -1735,106 +1921,33 @@ bool updater_launch_external_apply_and_exit_ready() {
 
     if (st != UPD_INST_STAGED || target.empty() || staged.empty() || manifest.empty()) return false;
 
-    std::error_code ec;
     fs::path dir = fs::u8path(target);
     fs::path src_helper = dir / "PokeV-Recomp-updater.exe";
-    fs::path tmp_helper = dir / ".PokeV-Recomp.updater.tmp.exe";
-    if (!fs::copy_file(src_helper, tmp_helper, fs::copy_options::overwrite_existing, ec)) {
-        set_install_failed("Failed to stage Windows update helper executable.");
-        return false;
-    }
-
-    HANDLE hParentInherit = nullptr;
-    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
-                         &hParentInherit, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
-        fs::remove(tmp_helper, ec);
-        set_install_failed("Failed to duplicate process handle for Windows update helper.");
-        return false;
-    }
-
-    auto quote_arg = [](const std::wstring &a) -> std::wstring {
-        std::wstring out = L"\"";
-        size_t bs = 0;
-        for (wchar_t c : a) {
-            if (c == L'\\') {
-                ++bs;
-            } else if (c == L'"') {
-                out.append(bs * 2 + 1, L'\\');
-                out.push_back(L'"');
-                bs = 0;
-            } else {
-                out.append(bs, L'\\');
-                out.push_back(c);
-                bs = 0;
-            }
-        }
-        out.append(bs * 2, L'\\');
-        out.push_back(L'"');
-        return out;
-    };
-
     auto to_w = [](const std::string &u8) -> std::wstring {
         if (u8.empty()) return L"";
         return fs::u8path(u8).wstring();
     };
+    std::vector<std::wstring> args = {
+        to_w(target),
+        to_w(staged),
+        to_w(manifest),
+        to_w(backup),
+        to_w(lock),
+        to_w(note_path),
+        to_w(tag),
+        L"15000",
+        L"1",
+    };
 
-    std::wstring cmd = quote_arg(tmp_helper.wstring()) + L" " +
-                       std::to_wstring((unsigned long)GetCurrentProcessId()) + L" " +
-                       std::to_wstring((unsigned long long)(uintptr_t)hParentInherit) + L" " +
-                       quote_arg(to_w(target)) + L" " +
-                       quote_arg(to_w(staged)) + L" " +
-                       quote_arg(to_w(manifest)) + L" " +
-                       quote_arg(to_w(backup)) + L" " +
-                       quote_arg(to_w(lock)) + L" " +
-                       quote_arg(to_w(note_path)) + L" " +
-                       quote_arg(to_w(tag)) + L" 15000 1";
-
-    SIZE_T attr_size = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
-    if (attr_size == 0) {
-        CloseHandle(hParentInherit);
-        fs::remove(tmp_helper, ec);
-        set_install_failed("Failed to size Windows process attribute list.");
-        return false;
-    }
-    std::vector<uint8_t> attr_buf(attr_size);
-    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
-    if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
-        CloseHandle(hParentInherit);
-        fs::remove(tmp_helper, ec);
-        set_install_failed("Failed to initialize Windows process attribute list.");
-        return false;
-    }
-    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                   &hParentInherit, sizeof(HANDLE), nullptr, nullptr)) {
-        DeleteProcThreadAttributeList(attr_list);
-        CloseHandle(hParentInherit);
-        fs::remove(tmp_helper, ec);
-        set_install_failed("Failed to bind inherited handle list for Windows update helper.");
+    std::string err;
+    if (!spawn_win_updater_helper(dir, src_helper, false, args, err)) {
+        set_install_failed(err);
         return false;
     }
 
     pthread_mutex_lock(&g_upd_lock);
     g_snap.install_state = UPD_INST_APPLYING;
     pthread_mutex_unlock(&g_upd_lock);
-
-    STARTUPINFOEXW siex{};
-    siex.StartupInfo.cb = sizeof(siex);
-    siex.lpAttributeList = attr_list;
-    PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(tmp_helper.wstring().c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW |
-                                 EXTENDED_STARTUPINFO_PRESENT,
-                             nullptr, dir.wstring().c_str(), &siex.StartupInfo, &pi);
-    DeleteProcThreadAttributeList(attr_list);
-    CloseHandle(hParentInherit);
-    if (!ok) {
-        fs::remove(tmp_helper, ec);
-        set_install_failed("Failed to launch Windows update helper process.");
-        return false;
-    }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
     return true;
 #else
     pthread_mutex_lock(&g_upd_lock);
