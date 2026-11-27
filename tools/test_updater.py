@@ -416,16 +416,16 @@ int main() {
         assert(blocks[5].kind == UPD_MD_CODE);
         assert(blocks[5].spans[0].text == "./PokeV-Recomp.AppImage");
 
-        // Verify prerelease channel flag in snapshot
+        // Verify prerelease channel flag in snapshot (cross-platform)
         set_env("LARECOMP_UPDATE_PRERELEASE", "1");
         set_env("LARECOMP_UPDATE_TAG", "v0.1.1-rc.1");
-        updater_configure("v0.1.0", data_dir.c_str(), false, false);
+        updater_configure("v0.1.0", NULL, false, false);
         updater_start_check(true);
         UpdaterSnapshot ps = wait_check_done();
         assert(ps.is_prerelease_channel == true);
         set_env("LARECOMP_UPDATE_PRERELEASE", NULL);
         set_env("LARECOMP_UPDATE_TAG", "v0.2.0");
-        updater_configure("v0.1.0", data_dir.c_str(), false, false);
+        updater_configure("v0.1.0", NULL, false, false);
         updater_start_check(true);
         ps = wait_check_done();
         assert(ps.is_prerelease_channel == false);
