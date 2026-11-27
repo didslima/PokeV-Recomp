@@ -25,6 +25,11 @@ TEST_CPP = r'''
 
 #ifndef _WIN32
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 extern "C" {
@@ -469,7 +474,11 @@ int main() {
         const char *zip_sym = getenv("LARECOMP_TEST_ZIP_SYM");
         const char *zip_badcrc = getenv("LARECOMP_TEST_ZIP_BADCRC");
         const char *zip_userdata = getenv("LARECOMP_TEST_ZIP_USERDATA");
+        const char *zip_z64_ovf = getenv("LARECOMP_TEST_ZIP_Z64OVF");
+        const char *zip_lfh_ovf = getenv("LARECOMP_TEST_ZIP_LFHOVF");
+        const char *zip_bomb_agg = getenv("LARECOMP_TEST_ZIP_BOMBAGG");
         assert(zip_good && zip_slip && zip_dup && zip_sym && zip_badcrc && zip_userdata);
+        assert(zip_z64_ovf && zip_lfh_ovf && zip_bomb_agg);
 
         std::string ztmp = std::string(getenv("LARECOMP_TEST_TMPDIR")) + "/zextract";
         WinZipExtractResult gres = updater_extract_zip_safe(zip_good, ztmp + "/good", "PokeV-Recomp/");
@@ -477,12 +486,22 @@ int main() {
         std::string verr;
         assert(updater_validate_windows_extracted_dir(ztmp + "/good", verr));
 
+        // Unicode + non-ASCII + spaces + long path extraction (cross-platform)
+        std::string uni_dest = std::string(getenv("LARECOMP_TEST_TMPDIR")) +
+                               "/Jo\xC3\xA3o Caf\xC3\xA9 \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E Dir/PokeV-Recomp";
+        WinZipExtractResult ures = updater_extract_zip_safe(zip_good, uni_dest, "PokeV-Recomp/");
+        assert(ures.ok);
+        assert(updater_validate_windows_extracted_dir(uni_dest, verr));
+
         assert(!updater_extract_zip_safe(zip_slip, ztmp + "/slip", "PokeV-Recomp/").ok);
         assert(!updater_extract_zip_safe(zip_dup, ztmp + "/dup", "PokeV-Recomp/").ok);
         assert(!updater_extract_zip_safe(zip_sym, ztmp + "/sym", "PokeV-Recomp/").ok);
         assert(!updater_extract_zip_safe(zip_badcrc, ztmp + "/badcrc", "PokeV-Recomp/").ok);
         assert(!updater_extract_zip_safe(zip_userdata, ztmp + "/userdata", "PokeV-Recomp/").ok);
-        printf("ok   windows zip asset parsing, path traversal, dup/symlink/crc & structure validation\n");
+        assert(!updater_extract_zip_safe(zip_z64_ovf, ztmp + "/z64ovf", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_lfh_ovf, ztmp + "/lfhovf", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_bomb_agg, ztmp + "/bombagg", "PokeV-Recomp/").ok);
+        printf("ok   windows zip asset parsing, unicode/long paths, overflow, bomb, dup/symlink/crc & structure\n");
     }
 
 #ifdef _WIN32
@@ -597,8 +616,47 @@ int main() {
         assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
         assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
         assert(ws.install_error == "Simulated rollback notice");
+
+        // Partial boot recovery (locked DLL): preserves .bak & marker, sets error, refuses update, then succeeds on 2nd launch
+        fs::create_directories(win_dir + "\\.PokeV-Recomp.update.bak");
+        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\PokeV-Recomp.exe", "restored-exe-2");
+        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\SDL3.dll", "restored-sdl3-2");
+        wbytes(win_dir + "\\.PokeV-Recomp.update-in-progress", "v0.2.0");
+        std::wstring sdl_w = fs::u8path(win_dir + "\\SDL3.dll").wstring();
+        HANDLE hLockDll = CreateFileW(sdl_w.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        assert(hLockDll != INVALID_HANDLE_VALUE);
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        ws = updater_get_snapshot();
+        assert(ws.install_state == UPD_INST_FAILED);
+        assert(ws.install_error.find(".PokeV-Recomp.update.bak") != std::string::npos);
+        assert(fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
+        assert(fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
+        assert(ws.install_kind == UPD_INSTALL_UNSUPPORTED);
+        CloseHandle(hLockDll);
+
+        // Second launch after lock released completes recovery cleanly
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        ws = updater_get_snapshot();
+        assert(ws.install_state == UPD_INST_IDLE);
+        assert(ws.install_kind == UPD_INSTALL_WINDOWS_ZIP);
+        assert(rbytes(win_dir + "\\PokeV-Recomp.exe") == "restored-exe-2");
+        assert(rbytes(win_dir + "\\SDL3.dll") == "restored-sdl3-2");
+        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
+        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
+
+        // Unicode Windows install & ZIP path test
+        std::string uni_zip_path = tmp + "\\Jo\xC3\xA3o Caf\xC3\xA9 \xC3\x81rea\\release.zip";
+        fs::create_directories(fs::u8path(tmp + "\\Jo\xC3\xA3o Caf\xC3\xA9 \xC3\x81rea"));
+        fs::copy_file(fs::u8path(zip_good), fs::u8path(uni_zip_path), fs::copy_options::overwrite_existing);
+        std::string uni_out = tmp + "\\Jo\xC3\xA3o Caf\xC3\xA9 \xC3\x81rea\\out";
+        WinZipExtractResult wuni = updater_extract_zip_safe(uni_zip_path, uni_out, "PokeV-Recomp/");
+        assert(wuni.ok);
+        std::string wverr;
+        assert(updater_validate_windows_extracted_dir(uni_out, wverr));
+
         set_env("LARECOMP_TEST_WIN_INSTALL_DIR", nullptr);
-        printf("ok   windows install detection, staging, sha256, low-disk & boot recovery\n");
+        printf("ok   windows install detection, staging, sha256, low-disk, partial & 2nd-boot recovery, unicode\n");
     }
 #endif
 
@@ -706,6 +764,7 @@ def build_test_zips(tmp: Path) -> dict:
         "PokeV-Recomp/zig/zig.exe": b"new-zig",
         "PokeV-Recomp/lasgen/lasgen.exe": b"new-lasgen",
         "PokeV-Recomp/zaprompts/zaprompts.exe": b"new-zaprompts",
+        "PokeV-Recomp/docs/Notas & Versão (João Café 日本語).txt": b"unicode entry ok",
         long_rel: b"long path & special chars ok",
     }
     with zipfile.ZipFile(good, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -746,6 +805,56 @@ def build_test_zips(tmp: Path) -> dict:
     with zipfile.ZipFile(userdata, "w") as zf:
         zf.writestr("PokeV-Recomp/larecomp.ini", b"overwrite-attempt=1")
     zips["USERDATA"] = str(userdata)
+
+    # ZIP64 EOCD offset near UINT64_MAX (overflow test)
+    import struct
+    z64ovf = tmp / "z64ovf.zip"
+    with zipfile.ZipFile(z64ovf, "w") as zf:
+        zf.writestr("PokeV-Recomp/a.txt", b"hi")
+    zraw = bytearray(z64ovf.read_bytes())
+    eocd_i = zraw.rfind(b"PK\x05\x06")
+    assert eocd_i != -1
+    locator = b"PK\x06\x07" + struct.pack("<IQ I", 0, 0xFFFFFFFFFFFFFFE0, 1)
+    zraw[eocd_i:eocd_i] = locator
+    z64ovf.write_bytes(bytes(zraw))
+    zips["Z64OVF"] = str(z64ovf)
+
+    # Local File Header offset near UINT64_MAX via ZIP64 extra field
+    lfhovf = tmp / "lfhovf.zip"
+    with zipfile.ZipFile(lfhovf, "w") as zf:
+        zf.writestr("PokeV-Recomp/a.txt", b"hi")
+    lraw = bytearray(lfhovf.read_bytes())
+    cd_i = lraw.rfind(b"PK\x01\x02")
+    assert cd_i != -1
+    # Set lfh_offset field (offset 42) to 0xFFFFFFFF and append ZIP64 extra field with 0xFFFFFFFFFFFFFFF0
+    nlen, elen, clen = struct.unpack_from("<HHH", lraw, cd_i + 28)
+    z64_ex = struct.pack("<HHQ", 0x0001, 8, 0xFFFFFFFFFFFFFFF0)
+    struct.pack_into("<I", lraw, cd_i + 42, 0xFFFFFFFF)
+    struct.pack_into("<H", lraw, cd_i + 30, elen + len(z64_ex))
+    ins_at = cd_i + 46 + nlen + elen
+    lraw[ins_at:ins_at] = z64_ex
+    eocd_i2 = lraw.rfind(b"PK\x05\x06")
+    cd_sz = struct.unpack_from("<I", lraw, eocd_i2 + 12)[0]
+    struct.pack_into("<I", lraw, eocd_i2 + 12, cd_sz + len(z64_ex))
+    lfhovf.write_bytes(bytes(lraw))
+    zips["LFHOVF"] = str(lfhovf)
+
+    # Aggregate decompression limit (> 2 GiB across 3 entries of 800 MiB declared)
+    bombagg = tmp / "bombagg.zip"
+    with zipfile.ZipFile(bombagg, "w") as zf:
+        zf.writestr("PokeV-Recomp/a.bin", b"1")
+        zf.writestr("PokeV-Recomp/b.bin", b"2")
+        zf.writestr("PokeV-Recomp/c.bin", b"3")
+    braw = bytearray(bombagg.read_bytes())
+    pos = 0
+    while True:
+        idx = braw.find(b"PK\x01\x02", pos)
+        if idx == -1:
+            break
+        struct.pack_into("<I", braw, idx + 24, 800 * 1024 * 1024)
+        pos = idx + 46
+    bombagg.write_bytes(bytes(braw))
+    zips["BOMBAGG"] = str(bombagg)
 
     return zips
 
