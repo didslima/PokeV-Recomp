@@ -102,3 +102,7 @@ gh run watch <run-id>
 - **F1**: Abre o Menu de Configurações (Resolução, VSync, Filtros, Áudio, Controles).
 - **F9**: Captura o dump de passes do próximo frame renderizado.
 - **F10**: Salva captura de tela em alta qualidade na pasta `screenshots/`.
+
+## Required Prior-Art Review Before New Features
+
+Before proposing or implementing any new feature or substantial architectural change, read [`docs/FEATURE-REFERENCE-REPOSITORIES.md`](docs/FEATURE-REFERENCE-REPOSITORIES.md) and perform its required review of the four reference repositories. Include a concise **Prior-art review** with evidence in the feature plan/task report before implementation. This is prospective and does not apply retroactively to the existing Windows auto-updater work or PR #63. Trivial fixes and routine maintenance are exempt as described in the guide.
