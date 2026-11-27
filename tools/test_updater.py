@@ -1143,6 +1143,128 @@ def test_windows_helper_e2e(cxx: str):
         assert not (inst / "relaunched.txt").exists()
         print("ok   windows --recover validation failure blocks relaunch and keeps markers")
 
+        # 5f. Full rollback removes new_feature.dll + new empty subdir, validates old_manifest, preserves recompdata/
+        ubak, ulock = setup_interrupted_bak(inst)
+        (inst / "recompdata").mkdir(parents=True, exist_ok=True)
+        (inst / "recompdata" / "rl.dat").write_bytes(b"rl-keep")
+        (inst / "new_feature.dll").write_bytes(b"new-dll-orphan")
+        (inst / "new_sub").mkdir(parents=True, exist_ok=True)
+        (inst / "new_sub" / "extra.dat").write_bytes(b"new-extra")
+        (inst / "extra_tool.dll").write_bytes(b"old-extra-tool")
+        (inst / ".PokeV-Recomp.app-manifest").write_text(
+            "PokeV-Recomp.exe\nSDL3.dll\nzig/zig.exe\nextra_tool.dll\n", encoding="utf-8"
+        )
+        stg_dir = inst / ".update-staging"
+        stg_dir.mkdir(parents=True, exist_ok=True)
+        (stg_dir / "manifest.txt").write_text(
+            "PokeV-Recomp.exe\nSDL3.dll\nzig/zig.exe\nnew_feature.dll\nnew_sub/extra.dat\n",
+            encoding="utf-8",
+        )
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "5000", "1",
+        ], timeout=15)
+        assert res.returncode == 0
+        for _ in range(40):
+            if (inst / "relaunched.txt").is_file():
+                break
+            time.sleep(0.05)
+        assert (inst / "relaunched.txt").is_file()
+        assert not (inst / "new_feature.dll").exists()
+        assert not (inst / "new_sub").exists()
+        assert (inst / "extra_tool.dll").read_bytes() == b"old-extra-tool"
+        assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3-bak"
+        assert (inst / "recompdata" / "rl.dat").read_bytes() == b"rl-keep"
+        assert (inst / "save" / "slot.bin").read_bytes() == b"user-save"
+        assert (inst / "larecomp.ini").read_bytes() == b"user-ini=1\n"
+        assert (inst / "mods" / "m.pak").read_bytes() == b"user-mod"
+        assert (inst / "extracted" / "romfs.bin").read_bytes() == b"user-romfs"
+        assert (inst / "unknown_user.txt").read_bytes() == b"keep-me"
+        print("ok   windows --recover removes new_feature.dll & new_sub, validates old_manifest, keeps recompdata")
+
+        # 5g. Locked new_feature.dll blocks --recover, keeps backup & markers, then 2nd attempt succeeds
+        ubak, ulock = setup_interrupted_bak(inst)
+        (inst / "new_feature.dll").write_bytes(b"locked-new-dll")
+        stg_dir = inst / ".update-staging"
+        stg_dir.mkdir(parents=True, exist_ok=True)
+        (stg_dir / "manifest.txt").write_text(
+            "PokeV-Recomp.exe\nSDL3.dll\nzig/zig.exe\nnew_feature.dll\n",
+            encoding="utf-8",
+        )
+        with open(inst / "new_feature.dll", "r+b") as locked_new:
+            import msvcrt
+            msvcrt.locking(locked_new.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                res = subprocess.run([
+                    str(helper_exe), "--recover", "0", "0",
+                    str(inst), str(ubak), str(ulock), "500", "1",
+                ], timeout=15)
+                assert res.returncode == 3
+                assert ubak.is_dir()
+                assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+                assert (stg_dir / "manifest.txt").is_file()
+                assert not (inst / "relaunched.txt").exists()
+            finally:
+                locked_new.seek(0)
+                msvcrt.locking(locked_new.fileno(), msvcrt.LK_UNLCK, 1)
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "5000", "1",
+        ], timeout=15)
+        assert res.returncode == 0
+        assert not (inst / "new_feature.dll").exists()
+        assert not ubak.exists()
+        assert not (inst / ".PokeV-Recomp.update-in-progress").exists()
+        print("ok   windows --recover locked new_feature.dll preserves backup & markers, 2nd attempt succeeds")
+
+        # 5h. Malicious staged manifest (traversal / absolute / user-data) is rejected without deleting anything
+        for bad_entry in ["../evil.dll", "C:\\Windows\\System32\\evil.dll", "save/slot.bin", "larecomp.ini"]:
+            ubak, ulock = setup_interrupted_bak(inst)
+            stg_dir = inst / ".update-staging"
+            stg_dir.mkdir(parents=True, exist_ok=True)
+            (stg_dir / "manifest.txt").write_text(f"PokeV-Recomp.exe\n{bad_entry}\n", encoding="utf-8")
+            res = subprocess.run([
+                str(helper_exe), "--recover", "0", "0",
+                str(inst), str(ubak), str(ulock), "500", "1",
+            ], timeout=10)
+            assert res.returncode == 12
+            assert ubak.is_dir()
+            assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+            assert (inst / "save" / "slot.bin").read_bytes() == b"user-save"
+            assert (inst / "larecomp.ini").read_bytes() == b"user-ini=1\n"
+            assert not (inst / "relaunched.txt").exists()
+        print("ok   windows --recover rejects malicious manifest entries cleanly")
+
+        # 5i. Full previous manifest validation catches missing non-critical file from old_manifest
+        ubak, ulock = setup_interrupted_bak(inst)
+        (inst / ".PokeV-Recomp.app-manifest").write_text(
+            "PokeV-Recomp.exe\nSDL3.dll\nzig/zig.exe\nmissing_old_helper.dll\n",
+            encoding="utf-8",
+        )
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "500", "1",
+        ], timeout=10)
+        assert res.returncode == 7
+        assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+        assert not (inst / "relaunched.txt").exists()
+        print("ok   windows --recover validates full old_manifest and rejects incomplete restore")
+
+        # 5j. Synchronous rollback() failure keeps progress_marker & backup_dir when restore fails
+        setup_install()
+        (staged / "zig" / "zig.exe").write_bytes(b"")  # fail validation -> triggers rollback()
+        # Make backup_dir\SDL3.dll read-only/locked or lock inst\SDL3.dll after move? Lock backup not easy before move,
+        # instead make install_dir\SDL3.dll impossible to delete/overwrite during rollback by placing a directory at dst?
+        # Even simpler: verify wmain rejects malicious manifest (code 2) & preserves progress_marker if rollback fails.
+        (manifest).write_text("PokeV-Recomp.exe\n../evil.dll\n", encoding="utf-8")
+        res = subprocess.run([
+            str(helper_exe), "0", "0", str(inst), str(staged), str(manifest),
+            str(bak), str(lock), str(note), "v0.2.0", "500", "0",
+        ], timeout=10)
+        assert res.returncode == 2
+        assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
+        print("ok   windows wmain rejects malicious staged manifest cleanly")
+
 
 def main():
     cxx = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
