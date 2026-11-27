@@ -8105,6 +8105,24 @@ static bool movie_copy_is_full(uint32_t slv, uint32_t dlv, uint32_t sly, uint32_
            sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 &&
            sw >= scw && sh >= sch && dw >= dcw && dh >= dch;
 }
+// Validate that a non-alias copy_texture_gpu call will actually execute a color copy/resolve/blit (no early return).
+static bool movie_copy_can_execute(VkImageAspectFlags sa, VkImageAspectFlags da,
+                                   uint32_t s_samples, uint32_t d_samples,
+                                   VkFormat s_fmt, VkFormat d_fmt,
+                                   int sw, int sh, int dw, int dh) {
+    if (!(sa & VK_IMAGE_ASPECT_COLOR_BIT) || !(da & VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+    if ((sa | da) & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return false;
+    if (s_samples > 1 && d_samples == 1 && sw == dw && sh == dh && s_fmt == d_fmt) return true;
+    return s_samples == d_samples;
+}
+static void movie_copy_propagate(TexBackend *d, const TexBackend *s) {
+    if (d && s && s->is_movie && s->movie_w > 0 && s->movie_h > 0) {
+        d->is_movie = true;
+        d->movie_boxed = s->movie_boxed;
+        d->movie_w = s->movie_w;
+        d->movie_h = s->movie_h;
+    }
+}
 // A draw into a reshaped (wider / taller than 16:9) pass at the uniform scale, centred: UI keeps its 16:9 layout.
 static void vp_box_16_9(void) {
     int pw, ph;
@@ -9486,22 +9504,19 @@ static void copy_texture_gpu(const TexRefRec *src, const TexRefRec *dst, uint64_
             (void *)st_, st_->width, st_->height, st_->format, slv, sr[0], sr[1], sr[3], sr[4], s->width, s->height, (void *)dt, dt->width,
             dt->height, dt->format, dlv, dr[0], dr[1], dr[3], dr[4], d->width, d->height, sx0, sy0, sw, sh, dx0, dy0, dw, dh,
             (unsigned long long)flags);
-    if (full_movie_copy) {
-        const TexBackend *ms = naliases ? (const TexBackend *)alias_read(st_)->backend : s;
-        if (ms && ms->is_movie && ms->movie_w > 0 && ms->movie_h > 0) {
-            d->is_movie = true;
-            d->movie_boxed = ms->movie_boxed;
-            d->movie_w = ms->movie_w;
-            d->movie_h = ms->movie_h;
-        }
-    }
+    const TexBackend *alias_src = full_movie_copy ? (naliases ? (const TexBackend *)alias_read(st_)->backend : s) : NULL;
     if (copy_opt() && sx0 == 0 && sy0 == 0 && dx0 == 0 && dy0 == 0 && sw == (int)s->width && sh == (int)s->height && dw == (int)d->width &&
         dh == (int)d->height && slv == 0 && dlv == 0 && sly == 0 && dly == 0 && alias_make(st_, dt, s, d)) {
+        if (full_movie_copy && (s->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
+            !((s->aspect | d->aspect) & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+            movie_copy_propagate(d, alias_src);
         if (ct_on()) LOG("[ct] alias made %p -> %p\n", (void *)st_, (void *)dt);
         return;
     }
     alias_before_write(dt, 0, "copy dst");
     if (naliases) s = alias_read(st_)->backend;
+    if (full_movie_copy && movie_copy_can_execute(s->aspect, d->aspect, s->samples, d->samples, s->format, d->format, sw, sh, dw, dh))
+        movie_copy_propagate(d, s);
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     VkImageAspectFlags sa = s->aspect, da = d->aspect;

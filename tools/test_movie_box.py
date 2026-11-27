@@ -42,8 +42,8 @@ static struct {
 #define ENV(name) getenv(name)
 
 typedef void *VkCommandBuffer;
-typedef enum { VK_FORMAT_UNDEFINED = 0, VK_FORMAT_R8G8B8A8_UNORM = 37 } VkFormat;
-typedef enum { VK_IMAGE_ASPECT_COLOR_BIT = 1 } VkImageAspectFlags;
+typedef enum { VK_FORMAT_UNDEFINED = 0, VK_FORMAT_R8G8B8A8_UNORM = 37, VK_FORMAT_B8G8R8A8_UNORM = 44, VK_FORMAT_D32_SFLOAT = 126 } VkFormat;
+typedef enum { VK_IMAGE_ASPECT_COLOR_BIT = 1, VK_IMAGE_ASPECT_DEPTH_BIT = 2, VK_IMAGE_ASPECT_STENCIL_BIT = 4 } VkImageAspectFlags;
 typedef struct { struct { int32_t x, y; } offset; struct { uint32_t width, height; } extent; } VkRect2D;
 typedef struct { VkRect2D rect; uint32_t baseArrayLayer, layerCount; } VkClearRect;
 typedef struct {
@@ -289,6 +289,50 @@ int main(void) {
             alias_dst.movie_h = alias_src.movie_h;
         }
         assert(alias_dst.is_movie && alias_dst.movie_boxed && alias_dst.movie_w == 1920 && alias_dst.movie_h == 1080);
+    }
+
+    // 16. movie_copy_can_execute: reject incompatible sample counts and depth/stencil images
+    {
+        TexBackend src = { .width = 1920, .height = 1080, .is_movie = true, .movie_boxed = false, .movie_w = 1920, .movie_h = 1080 };
+        TexBackend dst = { .width = 1920, .height = 1080 };
+
+        // Valid color copy / blit (1x -> 1x)
+        assert(movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                                      VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080));
+        assert(movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                                      VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, 1920, 1080, 1280, 720));
+        // Valid MSAA resolve (4x -> 1x, same extent & format)
+        assert(movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 4, 1,
+                                      VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080));
+
+        // Sample-count mismatches that return early without copying
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 4,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 4, 1,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1280, 720));
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 4, 1,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 4, 2,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080));
+
+        // Depth/stencil images (matching or mismatched format) must never propagate movie metadata
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 1, 1,
+                                       VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                                       VK_FORMAT_D32_SFLOAT, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080));
+        assert(!movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_STENCIL_BIT, 1, 1,
+                                       VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_D32_SFLOAT, 1920, 1080, 1920, 1080));
+
+        // Verify destination stays clean when copy cannot execute, and propagates when it can
+        if (movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 4,
+                                   VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080))
+            movie_copy_propagate(&dst, &src);
+        assert(!dst.is_movie && !dst.movie_boxed && dst.movie_w == 0 && dst.movie_h == 0);
+
+        if (movie_copy_can_execute(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                                   VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM, 1920, 1080, 1920, 1080))
+            movie_copy_propagate(&dst, &src);
+        assert(dst.is_movie && !dst.movie_boxed && dst.movie_w == 1920 && dst.movie_h == 1080);
     }
 
     printf("PASS: movie aspect-ratio boxing tests\n");
