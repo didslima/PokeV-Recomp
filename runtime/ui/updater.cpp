@@ -873,7 +873,9 @@ static void cleanup_on_boot_locked(const std::string &data_root, const std::stri
             if (stale) fs::remove(lock, ec);
         }
 
-        fs::remove_all(dir / ".update-staging", ec);
+        if (!g_snap.recovery_pending && !g_snap.recovery_blocked) {
+            fs::remove_all(dir / ".update-staging", ec);
+        }
         fs::remove(dir / ".PokeV-Recomp.updater.tmp.exe", ec);
     }
 #endif
