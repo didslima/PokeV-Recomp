@@ -383,18 +383,20 @@ void rt_sv_lua_clock_slot(uint64_t L, uint64_t slot, uint64_t s) {
 }
 
 // Scarlet / Violet's sequence players (sv_patches.py _sv_timeline_time) - the catch's camera work, cutscenes, UI
-// animations - step in 30 fps frames, by slot 1 / (33.3 ms - 1 ns), and each track is a clip from one whole frame to
-// another (start <= t < end). At 30 fps they are only ever sampled at whole frames. At 60 fps they are also sampled half
-// way, and a clip one frame long - a moment, to a sequence authored at 30 fps: a camera cut - was then live twice, the
-// second time with the clips around it: on throwing a Poké Ball, the camera of the frame after the cut was the sum of
-// two cameras (~3 km away, looking up: a frame of sky, then of a lake far below), and the terrain streaming and the
-// grass, which follow the camera, dropped what was near the real one - the ground near the catch missing for a few
-// frames and its tall grass for ~0.6 s. A sample inside such a clip, between whole frames, plays to the clip's end
-// instead, as 30 fps would have next; the half frame gained is given back on the player's next sample (the frame after
-// the cut is held once), so the sequence keeps its length and its sound. The tracks (manager = player + 0xe0: [+0x50,
-// +0x58) and [+0x18, +0x20), 0x1d0 bytes each) point at FlatBuffers tables whose fields at vtable offsets 8 and 0xa
-// are the clip's first frame and its end (as 0x7000b845c0 reads them). LARECOMP_SV_TIMELINE_SNAP=0: as before;
-// LARECOMP_LOG_TIMELINE_SNAP=1 logs each one.
+// animations - count in 60ths of a second, and each track is a clip from one whole frame to another (start <= t < end).
+// At 30 fps a sample steps 2 and lands on even frames only; at 60 fps it steps 1 and lands anywhere (frame times vary,
+// so a player's samples drift off whole frames). A clip one frame long is a moment: on an odd frame it is never seen at
+// 30 fps, on an even one it is seen once. At 60 fps the odd ones were seen too - on throwing a Poké Ball, the camera cut
+// has one: its frame's camera was the sum of two cameras (~3 km away, looking up: a frame of sky, then of a lake far
+// below), and the terrain streaming and the grass, which follow the camera, dropped what was near the real one - the
+// ground near the catch missing for a few frames and its tall grass for ~0.6 s. A sample inside such a clip, between
+// whole frames, plays it as 30 fps would: an even one at its own frame, once; an odd one, or one played already, at
+// its end. The time gained or lost is given back on the player's next sample (a hold never goes behind where it was
+// played), so the sequence keeps its length and its sound. (Its end every time skipped the even ones too: a Tera raid
+// catch lost its camera's keys, stayed low on the crystal rock and then turned up to the cavern's wall, where 30 fps
+// looks up the whole time.) The tracks (manager = player + 0xe0: [+0x50, +0x58) and [+0x18, +0x20), 0x1d0 bytes each)
+// point at FlatBuffers tables whose fields at vtable offsets 8 and 0xa are the clip's first frame and its end (as
+// 0x7000b845c0 reads them). LARECOMP_SV_TIMELINE_SNAP=0: as before; LARECOMP_LOG_TIMELINE_SNAP=1 logs each one.
 static uint32_t fb_u32(uint64_t tbl, uint32_t voff, uint32_t def) {
     if (tbl < 0x10000) return def;
     int32_t soff = 0;
@@ -412,8 +414,7 @@ static uint32_t fb_u32(uint64_t tbl, uint32_t voff, uint32_t def) {
     memcpy(&val, (const void *)(uintptr_t)(tbl + o), sizeof val);
     return val;
 }
-static float tl_moment_end(uint64_t player, float t) {  // (the end of a one-frame clip t is inside, between whole frames - or
-    // its start when t is only a float step's error past it; 0: none)
+static int tl_moment(uint64_t player, float t, float *start, float *end) {  // (the one-frame clip t is in, between whole frames)
     if (!isfinite(t) || t < 0.0f || t == floorf(t) || player < 0x10000) return 0;
     uint64_t mgr = player + 0xe0;
     static const uint32_t lists[2][2] = {{0x50, 0x58}, {0x18, 0x20}};
@@ -427,17 +428,21 @@ static float tl_moment_end(uint64_t player, float t) {  // (the end of a one-fra
             memcpy(&tbl, (const void *)(uintptr_t)tr, sizeof tbl);
             if (tbl < 0x10000) continue;
             uint32_t s0 = fb_u32(tbl, 8, 0), e0 = fb_u32(tbl, 0xa, 0);
-            if (e0 == s0 + 1 && (float)s0 <= t && t < (float)e0) return t - (float)s0 < 0.02f ? (float)s0 : (float)e0;
+            if (e0 == s0 + 1 && (float)s0 <= t && t < (float)e0) { *start = (float)s0, *end = (float)e0; return 1; }
         }
     }
     return 0;
 }
 enum { SV_TL_SLOTS = 32 };
-static struct { uint64_t player; float owed, last; } g_tl_owe[SV_TL_SLOTS];
+// (per player - a few run at once, several threads may step them: the time it was last played at, and the time it
+// played ahead of its own, < 0 behind)
+static struct { uint64_t player; float last, owed; } g_tl_pl[SV_TL_SLOTS];
+static int g_tl_next;
 static pthread_mutex_t g_tl_lock = PTHREAD_MUTEX_INITIALIZER;
 RT_ON_RESET(sv_timeline_reset) {
     pthread_mutex_lock(&g_tl_lock);
-    memset(g_tl_owe, 0, sizeof g_tl_owe);
+    memset(g_tl_pl, 0, sizeof g_tl_pl);
+    g_tl_next = 0;
     pthread_mutex_unlock(&g_tl_lock);
 }
 float rt_sv_timeline_time(uint64_t player, float t, float step) {
@@ -447,36 +452,34 @@ float rt_sv_timeline_time(uint64_t player, float t, float step) {
         const char *e = ENV("LARECOMP_SV_TIMELINE_SNAP");
         on = !e || atoi(e) != 0;
         log = ENV("LARECOMP_LOG_TIMELINE_SNAP") != NULL;
-        LOG("[pace] Scarlet / Violet one-frame sequence clips played as moments at 60 fps: %s\n", on ? "on" : "off (LARECOMP_SV_TIMELINE_SNAP=0)");
+        LOG("[pace] Scarlet / Violet one-frame sequence clips played as at 30 fps: %s\n", on ? "on" : "off (LARECOMP_SV_TIMELINE_SNAP=0)");
     }
     if (!on || !rt_pla_is_60fps() || !isfinite(t) || t < 0.0f) {
         pthread_mutex_unlock(&g_tl_lock);
         return t;
     }
     int slot = -1;
-    for (int i = 0; i < SV_TL_SLOTS; i++) if (g_tl_owe[i].player == player) { slot = i; break; }
-    if (slot >= 0 && g_tl_owe[slot].owed > 0) {
-        // Only pay back the owed half-frame if this looks like the next step of the same sequence
-        // (guards against restarted sequences or reused player addresses jumping forward to stale `last`).
-        if (t >= g_tl_owe[slot].last - 0.5f && t <= g_tl_owe[slot].last + 2.0f) {
-            float back = t - g_tl_owe[slot].owed;
-            t = back > g_tl_owe[slot].last ? back : g_tl_owe[slot].last;
+    for (int i = 0; i < SV_TL_SLOTS; i++) if (g_tl_pl[i].player == player) { slot = i; break; }
+    float last = -1.0f;  // (not played: no clip counts as played)
+    if (slot < 0) slot = g_tl_next, g_tl_next = (g_tl_next + 1) % SV_TL_SLOTS;
+    else if (t >= g_tl_pl[slot].last - 0.5f && t <= g_tl_pl[slot].last + 4.0f) {
+        // (the next step of the same sequence - else restarted, or the player's address reused: nothing kept)
+        last = g_tl_pl[slot].last;
+        float back = t - g_tl_pl[slot].owed;
+        t = g_tl_pl[slot].owed > 0 && back < last ? last : back;
+    }
+    float played = t, s0, e0;
+    if (tl_moment(player, t, &s0, &e0)) {
+        if (((uint32_t)s0 & 1) == 0 && last < s0) {  // (on 30 fps's frames, not played yet: at its own frame, once)
+            played = s0;
+            if (log && t - s0 >= 0.02f) LOG("[pace] sequence player %llx: %.3f inside a one-frame clip, played at its frame %.0f\n", (unsigned long long)player, t, s0);
+        } else {  // (between 30 fps's frames - never seen there - or played already: at its end)
+            played = e0;
+            if (log) LOG("[pace] sequence player %llx: %.3f inside a one-frame clip at %.0f, played at %.0f\n", (unsigned long long)player, t, s0, e0);
         }
-        g_tl_owe[slot].player = 0;
-        g_tl_owe[slot].owed = 0;
-        g_tl_owe[slot].last = 0;
     }
-    float end = tl_moment_end(player, t);
-    if (end > 0 && end <= t) t = end;  // (a float step's error past a whole frame: that frame)
-    else if (end > t) {
-        if (log) LOG("[pace] sequence player %llx: %.3f inside a one-frame clip, played at %.0f\n", (unsigned long long)player, t, end);
-        if (slot < 0) for (int i = 0; i < SV_TL_SLOTS; i++) if (!g_tl_owe[i].player) { slot = i; break; }
-        if (slot < 0) slot = (int)(player >> 4) % SV_TL_SLOTS;
-        g_tl_owe[slot].player = player;
-        g_tl_owe[slot].owed = end - t;
-        g_tl_owe[slot].last = end;
-        t = end;
-    }
+    g_tl_pl[slot].player = player, g_tl_pl[slot].last = played, g_tl_pl[slot].owed = played - t;
+    t = played;
     pthread_mutex_unlock(&g_tl_lock);
     (void)step;
     return t;

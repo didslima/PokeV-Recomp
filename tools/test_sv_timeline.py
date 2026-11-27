@@ -47,7 +47,7 @@ typedef struct {
 
 static uint8_t g_player1[0x200];
 static uint8_t g_player2[0x200];
-static uint8_t g_tracks1[0x1d0 * 2];
+static uint8_t g_tracks1[0x1d0 * 2];  // (two tracks: an even clip and an odd one)
 static uint8_t g_tracks2[0x1d0];
 
 int main(void) {
@@ -69,20 +69,38 @@ int main(void) {
     memcpy(g_player1 + 0xe0 + 0x50, &b1, 8);
     memcpy(g_player1 + 0xe0 + 0x58, &e1, 8);
 
+    // Odd one-frame clip [11, 12) on the same track list (never seen at 30 fps, whose samples land on even frames)
+    static struct { TestVTable vt; TestTable tbl; } fb3;
+    fb3.vt = fb1.vt;
+    fb3.tbl.soff = (int32_t)((uintptr_t)&fb3.tbl - (uintptr_t)&fb3.vt);
+    fb3.tbl.s0 = 11;
+    fb3.tbl.e0 = 12;
+    uint64_t tbl3_ptr = (uint64_t)(uintptr_t)&fb3.tbl;
+    memcpy(g_tracks1 + 0x1d0, &tbl3_ptr, 8);
+    e1 = b1 + 0x1d0 * 2;
+    memcpy(g_player1 + 0xe0 + 0x58, &e1, 8);
+
     const char *snap_env = getenv("LARECOMP_SV_TIMELINE_SNAP");
     bool snap_on = !snap_env || atoi(snap_env) != 0;
+#define NEAR(a, b) (fabsf((a) - (b)) < 1e-4f)
 
-    // Sample at 10.5 -> snapped to 11.0 when on, untouched 10.5 when off
-    float t1 = rt_sv_timeline_time(p1, 10.5f, 0.5f);
-    assert(fabsf(t1 - (snap_on ? 11.0f : 10.5f)) < 1e-5f);
-    // Next frame at 11.0 -> pays back 0.5, held at 11.0
-    float t2 = rt_sv_timeline_time(p1, 11.0f, 0.5f);
-    assert(fabsf(t2 - 11.0f) < 1e-5f);
+    // 1a. Even clip [10, 11), first sampled at 10.5: played at its own frame, 10 (as 30 fps does)
+    assert(NEAR(rt_sv_timeline_time(p1, 10.5f, 1.0f), snap_on ? 10.0f : 10.5f));
+    // ...the half frame held back is given on the next sample: 10.0 + 1.0 + 0.5 = 11.5, inside the odd clip [11, 12):
+    // never seen at 30 fps, so at its end, 12
+    assert(NEAR(rt_sv_timeline_time(p1, snap_on ? 11.0f : 11.5f, 1.0f), snap_on ? 12.0f : 11.5f));
+    // ...the half frame gained is given back: 12.0 + 1.0 - 0.5 = 12.5
+    assert(NEAR(rt_sv_timeline_time(p1, snap_on ? 13.0f : 12.5f, 1.0f), 12.5f));
 
-    // 2. Restarted sequence / reused address: t=10.5 -> owe=0.5, then player restarts at t=0.5 (must NOT jump to 11.0!)
-    assert(fabsf(rt_sv_timeline_time(p1, 10.5f, 0.5f) - (snap_on ? 11.0f : 10.5f)) < 1e-5f);
-    float trestart = rt_sv_timeline_time(p1, 0.5f, 0.5f);
-    assert(fabsf(trestart - 0.5f) < 1e-5f);
+    // 1b. Even clip sampled at its whole frame, then again inside it: played once, the second sample at its end
+    assert(NEAR(rt_sv_timeline_time(p1, 9.9f, 0.5f), 9.9f));  // (restarted: back from 12.5)
+    assert(NEAR(rt_sv_timeline_time(p1, 10.0f, 0.1f), 10.0f));
+    assert(NEAR(rt_sv_timeline_time(p1, 10.5f, 0.5f), snap_on ? 11.0f : 10.5f));
+
+    // 2. Restarted sequence / reused address: a held-back time is not paid to a player that starts again
+    assert(NEAR(rt_sv_timeline_time(p1, 0.5f, 0.5f), 0.5f));
+    assert(NEAR(rt_sv_timeline_time(p1, 10.5f, 0.5f), snap_on ? 10.0f : 10.5f));
+    assert(NEAR(rt_sv_timeline_time(p1, 0.5f, 0.5f), 0.5f));
 
     // 3. Multiple concurrent players + malformed FlatBuffer (soff == 0, vsize == 2)
     static struct { TestVTable vt; TestTable tbl; } fb_bad;
@@ -93,11 +111,11 @@ int main(void) {
     uint64_t b2 = (uint64_t)(uintptr_t)g_tracks2, e2 = b2 + 0x1d0;
     memcpy(g_player2 + 0xe0 + 0x18, &b2, 8);
     memcpy(g_player2 + 0xe0 + 0x20, &e2, 8);
-    assert(fabsf(rt_sv_timeline_time(p2, 5.5f, 0.5f) - 5.5f) < 1e-5f);
+    assert(NEAR(rt_sv_timeline_time(p2, 5.5f, 0.5f), 5.5f));
 
     // 4. 30 FPS mode leaves time untouched; NaN / negative untouched
     setenv("TEST_60FPS", "0", 1);
-    assert(fabsf(rt_sv_timeline_time(p1, 10.5f, 0.5f) - 10.5f) < 1e-5f);
+    assert(NEAR(rt_sv_timeline_time(p1, 10.5f, 0.5f), 10.5f));
     setenv("TEST_60FPS", "1", 1);
     assert(rt_sv_timeline_time(p1, -1.0f, 0.5f) == -1.0f);
 
