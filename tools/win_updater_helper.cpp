@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cwctype>
 #include <string>
@@ -27,20 +28,24 @@ static std::wstring to_long_win_path(const std::wstring &p) {
 }
 
 static std::wstring utf8_to_wide(const std::string &u8) {
-    if (u8.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, nullptr, 0);
+    if (u8.empty() || u8.size() > (size_t)INT_MAX) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), nullptr, 0);
     if (n <= 0) return L"";
-    std::wstring w(n - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, w.data(), n);
+    std::wstring w((size_t)n, L'\0');
+    int written = MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), w.data(), n);
+    if (written <= 0) return L"";
+    w.resize((size_t)written);
     return w;
 }
 
 static std::string wide_to_utf8(const std::wstring &w) {
-    if (w.empty()) return "";
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (w.empty() || w.size() > (size_t)INT_MAX) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     if (n <= 0) return "";
-    std::string s(n - 1, '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, s.data(), n, nullptr, nullptr);
+    std::string s((size_t)n, '\0');
+    int written = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    if (written <= 0) return "";
+    s.resize((size_t)written);
     return s;
 }
 

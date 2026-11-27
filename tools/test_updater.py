@@ -1270,6 +1270,29 @@ def test_windows_helper_e2e(cxx: str):
         assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
         print("ok   windows wmain rejects malicious staged manifest cleanly")
 
+        # 5k. Unicode & non-Latin paths/filenames + empty arg handling in win_updater_helper
+        nonlatin_inst = t / "João Café 日本語 Кириллица 한국어"
+        nbak, nlock = setup_interrupted_bak(nonlatin_inst)
+        # Add ASCII, accented, and non-Latin files in backup + staged manifest
+        for rel_name in ["ascii_file.txt", "versão_ação.txt", "日本語_テスト.txt", "Кириллица.txt"]:
+            (nbak / rel_name).write_bytes(b"bak-content")
+        (nonlatin_inst / "novo_日本語.dll").write_bytes(b"orphan-nonlatin")
+        stg_n = nonlatin_inst / ".update-staging"
+        stg_n.mkdir(parents=True, exist_ok=True)
+        (stg_n / "manifest.txt").write_text(
+            "PokeV-Recomp.exe\nSDL3.dll\nzig/zig.exe\nnovo_日本語.dll\n",
+            encoding="utf-8",
+        )
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(nonlatin_inst), str(nbak), str(nlock), "", "0",
+        ], timeout=15)
+        assert res.returncode == 0
+        assert not (nonlatin_inst / "novo_日本語.dll").exists()
+        for rel_name in ["ascii_file.txt", "versão_ação.txt", "日本語_テスト.txt", "Кириллица.txt"]:
+            assert (nonlatin_inst / rel_name).read_bytes() == b"bak-content"
+        print("ok   windows --recover handles empty args, ASCII, accents & non-Latin Unicode paths")
+
 
 def main():
     cxx = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -434,11 +435,13 @@ static uint64_t rd64(const uint8_t *p) {
 
 #ifdef _WIN32
 static std::wstring utf8_to_wide_long(const std::string &u8) {
-    if (u8.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, nullptr, 0);
+    if (u8.empty() || u8.size() > (size_t)INT_MAX) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), nullptr, 0);
     if (n <= 0) return L"";
-    std::wstring w(n - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, w.data(), n);
+    std::wstring w((size_t)n, L'\0');
+    int written = MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), w.data(), n);
+    if (written <= 0) return L"";
+    w.resize((size_t)written);
     std::replace(w.begin(), w.end(), L'/', L'\\');
     if (w.size() >= 240 && w.rfind(L"\\\\?\\", 0) != 0) {
         if (w.rfind(L"\\\\", 0) == 0) w = L"\\\\?\\UNC\\" + w.substr(2);
