@@ -928,6 +928,9 @@ static void upload_pending(TexBackend *b) {
     b->pending_rgba = NULL;
     pthread_mutex_unlock(&pending_lock);
     if (!px) return;
+    b->is_movie = true;
+    b->movie_w = w;
+    b->movie_h = h;
     if (nv12) { vk_convert_nv12(b, px, w, h, stride, uv_off); free(px); return; }
     if (w > b->width) w = b->width;
     if (h > b->height) h = b->height;
@@ -1186,8 +1189,13 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (b->pending_rgba) upload_pending(b);
-    if (for_render) b->gpu_owned = true;
-    else if (!b->gpu_owned) {
+    if (for_render) {
+        b->gpu_owned = true;
+        b->is_movie = false;
+        b->movie_w = b->movie_h = 0;
+    } else if (!b->gpu_owned) {
+        b->is_movie = false;
+        b->movie_w = b->movie_h = 0;
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
         upload_texture(t, b);
@@ -1226,6 +1234,8 @@ void backend_prefetch_texture(NvnTexture *t) {
 void renderer_mark_gpu_owned(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     b->gpu_owned = true;
+    b->is_movie = false;
+    b->movie_w = b->movie_h = 0;
     if (b->scalable) { b->sx = g_rs_x; b->sy = g_rs_y; }
 }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
@@ -1243,6 +1253,9 @@ static void upload_rgba_now(NvnTexture *t, const void *rgba, uint32_t w, uint32_
     b->pending_w = w; b->pending_h = h; b->pending_stride = stride;
     b->pending_nv12 = false;
     b->gpu_owned = true;
+    b->is_movie = true;
+    b->movie_w = w;
+    b->movie_h = h;
     pthread_mutex_unlock(&pending_lock);
 }
 
@@ -1292,6 +1305,9 @@ static bool upload_nv12_now(NvnTexture *t, const void *nv12, uint32_t w, uint32_
     b->pending_nv12 = true;
     b->pending_uv_off = uv_off;
     b->gpu_owned = true;
+    b->is_movie = true;
+    b->movie_w = w;
+    b->movie_h = h;
     pthread_mutex_unlock(&pending_lock);
     return true;
 }

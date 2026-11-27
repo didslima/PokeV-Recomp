@@ -1648,7 +1648,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 // The pass's attachments, size and scale (begin_pass). Per thread: an async run's workers draw with their pass's while
 // the render thread begins the next ones (sw_async_*: pass_tls is the job's copy).
-typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers; } PassG;
+typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers; bool movie_cleared; } PassG;
 static PassG pass_main = {.sx = 1, .sy = 1, .samples = 1, .layers = 1};
 static __thread PassG *pass_tls;
 static inline PassG *pass_cur(void) { PassG *p = pass_tls; return p ? p : &pass_main; }
@@ -1962,6 +1962,7 @@ static void begin_pass_(void) {
         static bool logged_none;
         if (!logged_none) logged_none = true, LOG("[vk] pass with no attachments (%d color slots bound)\n", st.rt.ncolor);
     }
+    pass_cur()->movie_cleared = pass_ncolor > 0 && ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
     // A pass with depth / stencil but no color attachment gets a throwaway one on Intel (LARECOMP_VK_PLACEHOLDER_COLOR=0 /
     // 1 overrides): the UHD 630's Windows driver (Vulkan 1.3.215) crashes in the vkCmdBeginRendering after such a pass,
     // reading near a null pointer (issues #8, #46). Pipelines and clears follow pass_ncolor / pass_color as usual.
@@ -7957,6 +7958,58 @@ static int i22fix_apply(Prog **prp, const CmdRec *r, bool indexed, ShaderKey *vk
     return -1;
 }
 // ---- end of issue #22
+// A draw into a reshaped pass centred to `src_aspect` (pillarboxed on wider targets, letterboxed on taller ones).
+static void vp_box_aspect(float src_aspect) {
+    if (!st.rt.color[0] || !(src_aspect > 0.0f) || !isfinite(src_aspect)) return;
+    uint32_t gw = st.rt.color[0]->width, gh = st.rt.color[0]->height;
+    int pw, ph;
+    pass_size(&pw, &ph);
+    if (pw <= 0 || ph <= 0 || !gw || !gh) return;
+    float pass_aspect = (float)pw / (float)ph;
+    float box_w, box_h;
+    if (pass_aspect > src_aspect) {
+        box_h = (float)ph;
+        box_w = box_h * src_aspect;
+        vp_ox = ((float)pw - box_w) * 0.5f;
+        vp_oy = 0.0f;
+    } else {
+        box_w = (float)pw;
+        box_h = box_w / src_aspect;
+        vp_ox = 0.0f;
+        vp_oy = ((float)ph - box_h) * 0.5f;
+    }
+    vp_sx = box_w / (float)gw;
+    vp_sy = box_h / (float)gh;
+}
+// Clear only the unused sidebar/letterbox strips around a boxed movie draw so reused intermediate targets show black.
+static void clear_movie_bars(VkCommandBuffer cb) {
+    if (pass_cur()->movie_cleared || !pass_ncolor || pass_color[0] == VK_FORMAT_UNDEFINED) return;
+    pass_cur()->movie_cleared = true;
+    int pw, ph;
+    pass_size(&pw, &ph);
+    if (pw <= 0 || ph <= 0) return;
+    VkClearRect rects[2];
+    uint32_t n = 0;
+    if (vp_ox > 0.5f) {
+        uint32_t bw = (uint32_t)floorf(vp_ox);
+        if (bw > (uint32_t)pw / 2) bw = (uint32_t)pw / 2;
+        if (bw) {
+            rects[n++] = (VkClearRect){{{0, 0}, {bw, (uint32_t)ph}}, 0, pass_layers};
+            rects[n++] = (VkClearRect){{{pw - (int32_t)bw, 0}, {bw, (uint32_t)ph}}, 0, pass_layers};
+        }
+    } else if (vp_oy > 0.5f) {
+        uint32_t bh = (uint32_t)floorf(vp_oy);
+        if (bh > (uint32_t)ph / 2) bh = (uint32_t)ph / 2;
+        if (bh) {
+            rects[n++] = (VkClearRect){{{0, 0}, {(uint32_t)pw, bh}}, 0, pass_layers};
+            rects[n++] = (VkClearRect){{{0, ph - (int32_t)bh}, {(uint32_t)pw, bh}}, 0, pass_layers};
+        }
+    }
+    if (!n) return;
+    VkClearAttachment ca = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+                            .clearValue.color.float32 = {0.0f, 0.0f, 0.0f, 1.0f}};
+    rec_CmdClearAttachments(cb, 1, &ca, n, rects);
+}
 // A draw into a reshaped (wider / taller than 16:9) pass at the uniform scale, centred: UI keeps its 16:9 layout.
 static void vp_box_16_9(void) {
     int pw, ph;
@@ -8420,7 +8473,22 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 #undef FTEX
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
-    if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
+    bool movie_boxed = false;
+    static int movie_box_on = -1;
+    if (movie_box_on < 0) { const char *e = ENV("LARECOMP_WIDE_MOVIE_BOX"); movie_box_on = !e || atoi(e) != 0; }
+    if (movie_box_on && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor) {
+        for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+            NvnTexture *t = FTEX(i);
+            const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+            if (b && b->is_movie && b->movie_w > 0 && b->movie_h > 0) {
+                vp_box_aspect((float)b->movie_w / (float)b->movie_h);
+                clear_movie_bars(cb);
+                movie_boxed = true;
+                break;
+            }
+        }
+    }
+    if (!movie_boxed && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
         bool reads_scene = false;
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
@@ -8445,7 +8513,7 @@ static void draw_(CmdRec *r, bool indexed) {
         bool composite = reads_scene || fade_fill || (fullscreen_fill && wide_frame == renderer_exec_frame());
         if (!composite) wide_frame = ~0ull;
         if (!composite) vp_box_16_9();
-    } else if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && st.ubuf[0][0].addr) {
+    } else if (!movie_boxed && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && st.ubuf[0][0].addr) {
         // HUD layout panes and font text drawn into a reshaped intermediate composite target: centred 16:9 box.
         extern bool widescreen_ui_boxed_draw(const float *u, uint64_t size, int ntex,
                                              const float (*sc_)[2], const uint32_t (*wh_)[2]);
