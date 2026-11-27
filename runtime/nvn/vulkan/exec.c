@@ -1648,7 +1648,7 @@ uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 // The pass's attachments, size and scale (begin_pass). Per thread: an async run's workers draw with their pass's while
 // the render thread begins the next ones (sw_async_*: pass_tls is the job's copy).
-typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers; bool movie_cleared; } PassG;
+typedef struct { float sx, sy; VkFormat color[8], depth, stencil; uint32_t ncolor, samples, w, h, layers, movie_bar_w, movie_bar_h; } PassG;
 static PassG pass_main = {.sx = 1, .sy = 1, .samples = 1, .layers = 1};
 static __thread PassG *pass_tls;
 static inline PassG *pass_cur(void) { PassG *p = pass_tls; return p ? p : &pass_main; }
@@ -1962,7 +1962,8 @@ static void begin_pass_(void) {
         static bool logged_none;
         if (!logged_none) logged_none = true, LOG("[vk] pass with no attachments (%d color slots bound)\n", st.rt.ncolor);
     }
-    pass_cur()->movie_cleared = pass_ncolor > 0 && ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+    pass_cur()->movie_bar_w = 0;
+    pass_cur()->movie_bar_h = 0;
     // A pass with depth / stencil but no color attachment gets a throwaway one on Intel (LARECOMP_VK_PLACEHOLDER_COLOR=0 /
     // 1 overrides): the UHD 630's Windows driver (Vulkan 1.3.215) crashes in the vkCmdBeginRendering after such a pass,
     // reading near a null pointer (issues #8, #46). Pipelines and clears follow pass_ncolor / pass_color as usual.
@@ -2276,6 +2277,7 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
     begin_pass();
+    pass_cur()->movie_bar_w = pass_cur()->movie_bar_h = 0;
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
@@ -7981,10 +7983,9 @@ static void vp_box_aspect(float src_aspect) {
     vp_sx = box_w / (float)gw;
     vp_sy = box_h / (float)gh;
 }
-// Clear only the unused sidebar/letterbox strips around a boxed movie draw so reused intermediate targets show black.
+// Clear only the unused sidebar/letterbox strips around a boxed movie draw so reused targets or prior draws show black.
 static void clear_movie_bars(VkCommandBuffer cb) {
-    if (pass_cur()->movie_cleared || !pass_ncolor || pass_color[0] == VK_FORMAT_UNDEFINED) return;
-    pass_cur()->movie_cleared = true;
+    if (!pass_ncolor || pass_color[0] == VK_FORMAT_UNDEFINED) return;
     int pw, ph;
     pass_size(&pw, &ph);
     if (pw <= 0 || ph <= 0) return;
@@ -7993,14 +7994,16 @@ static void clear_movie_bars(VkCommandBuffer cb) {
     if (vp_ox > 0.5f) {
         uint32_t bw = (uint32_t)floorf(vp_ox);
         if (bw > (uint32_t)pw / 2) bw = (uint32_t)pw / 2;
-        if (bw) {
+        if (bw > pass_cur()->movie_bar_w) {
+            pass_cur()->movie_bar_w = bw;
             rects[n++] = (VkClearRect){{{0, 0}, {bw, (uint32_t)ph}}, 0, pass_layers};
             rects[n++] = (VkClearRect){{{pw - (int32_t)bw, 0}, {bw, (uint32_t)ph}}, 0, pass_layers};
         }
     } else if (vp_oy > 0.5f) {
         uint32_t bh = (uint32_t)floorf(vp_oy);
         if (bh > (uint32_t)ph / 2) bh = (uint32_t)ph / 2;
-        if (bh) {
+        if (bh > pass_cur()->movie_bar_h) {
+            pass_cur()->movie_bar_h = bh;
             rects[n++] = (VkClearRect){{{0, 0}, {(uint32_t)pw, bh}}, 0, pass_layers};
             rects[n++] = (VkClearRect){{{0, ph - (int32_t)bh}, {(uint32_t)pw, bh}}, 0, pass_layers};
         }
@@ -8485,6 +8488,20 @@ static void draw_(CmdRec *r, bool indexed) {
                 clear_movie_bars(cb);
                 movie_boxed = true;
                 break;
+            }
+        }
+        if (!movie_boxed) {
+            extern bool movie_cpu_video_active(uint32_t *w, uint32_t *h);
+            uint32_t cpu_mw = 0, cpu_mh = 0;
+            if (movie_cpu_video_active(&cpu_mw, &cpu_mh)) {
+                for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+                    if (tex_wh[1][i][0] == cpu_mw && tex_wh[1][i][1] == cpu_mh) {
+                        vp_box_aspect((float)cpu_mw / (float)cpu_mh);
+                        clear_movie_bars(cb);
+                        movie_boxed = true;
+                        break;
+                    }
+                }
             }
         }
     }
