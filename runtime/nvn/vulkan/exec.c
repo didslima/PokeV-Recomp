@@ -13031,7 +13031,7 @@ static const MoIv *mo_iv_find(const MoIv *v, int n, uint64_t off, uint64_t size)
 }
 static pthread_mutex_t mo_mu = PTHREAD_MUTEX_INITIALIZER;
 
-// last frame's constant buffers, per arena address (one entry per character mesh)
+// last frame's constant buffers, per draw (arena address, program, the how-manyth draw of the pair: objmv_capture)
 typedef struct { uint64_t key, size, frame[2]; uint32_t mask, len[2][18], cap[2][18]; uint8_t *data[2][18]; } MvCbuf;
 static MvCbuf mo_cb[2048];
 
@@ -13092,19 +13092,28 @@ static void objmv_capture(Prog *pr, Pipe *pp, uint32_t streams, const VkDescript
         mo.iv = v, mo.iv_cap = cap;
     }
     mo.iv[mo.niv++] = (MoIv){off, off + v0.size, 0};
-    // this frame's constant buffers kept for the next; last frame's, if this mesh was drawn then
-    MvCbuf *e = mo_cbuf(v0.addr, f);
-    if (!e) {
-        static int nl;
-        if (nl++ < 5) LOG("[objmv] frame %llu: no room for another mesh (2048 drawn in the last 2 frames)\n", (unsigned long long)f);
-        goto out;
-    }
+    // this frame's constant buffers kept for the next; last frame's, if this draw was made then. One entry per draw: the
+    // mesh (its arena address), the program and the how-manyth draw of that pair this frame. The same skinned mesh is
+    // drawn more than once a frame - a depth pass and the G-buffer, or another program over it with constant buffers
+    // of its own (a Tera raid boss's crystal coat: mask ca8 over 420) - and one entry per mesh gave the later draws the
+    // first one's constant buffers for last frame: motion of tens of thousands of pixels over the whole boss, which
+    // DLSS drew as moving black lines
     // (constant buffer k is the state's slot k - 3, as cbuf_info finds it; 0-2 are the driver's own: not the game's)
     uint32_t mask = pr->vi->cbuf_mask & 0x3FFF8u;
     int cur = (int)(f & 1), prv = !cur;
-    bool again = e->frame[cur] == f;  // (the mesh drawn again this frame - another scene pass: its copies are made)
-    e->frame[cur] = f;
-    for (int i = 0; i < 18 && !again; i++) {
+    MvCbuf *e = NULL;
+    for (uint64_t k = 0; k < 8; k++) {
+        uint64_t key = v0.addr ^ ((uint64_t)(uintptr_t)pr * 0x9E3779B97F4A7C15ull) ^ (k * 0xC2B2AE3D27D4EB4Full);
+        MvCbuf *c = mo_cbuf(key ? key : 1, f);
+        if (!c) break;
+        if (c->frame[cur] != f) { e = c; break; }  // (the first of the pair's entries not taken yet this frame)
+    }
+    if (!e) {
+        static int nl;
+        if (nl++ < 5) LOG("[objmv] frame %llu: no room for another draw (2048 made in the last 2 frames, or 8 of one mesh and program)\n", (unsigned long long)f);
+        goto out;
+    }
+    for (int i = 0; i < 18; i++) {
         if (!(mask >> i & 1)) continue;
         Range r = st.ubuf[0][i - 3];
         uint32_t len = r.addr && r.size ? (uint32_t)(r.size < 65536 ? r.size : 65536) : 0;
@@ -13116,6 +13125,7 @@ static void objmv_capture(Prog *pr, Pipe *pp, uint32_t streams, const VkDescript
         if (len) memcpy(e->data[cur][i], (const void *)(uintptr_t)r.addr, len);
         e->len[cur][i] = len;
     }
+    e->frame[cur] = f;  // (only mark valid once every slot copied; a mid-loop OOM must not expose stale f-2 slots)
     mo.captured++;
     bool have_prev = e->frame[prv] + 1 == f && e->size == v0.size && mo.prev_frame + 1 == f && mo.prev_moves == xm_moves;
     e->size = v0.size, e->mask = mask;
