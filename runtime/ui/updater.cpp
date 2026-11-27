@@ -1,4 +1,5 @@
 #include "updater.h"
+#include "win_zip.h"
 
 #include "../cache_sha256.h"
 
@@ -20,6 +21,12 @@
 #include <signal.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <process.h>
 #endif
 
 extern "C" {
@@ -35,6 +42,7 @@ static const char *GITHUB_RELEASES_URL =
 static const char *GITHUB_RELEASES_WEB =
     "https://github.com/didslima/PokeV-Recomp/releases";
 static const char *LINUX_ASSET_NAME = "PokeV-Recomp-linux-x86_64.AppImage";
+static const char *WINDOWS_ASSET_NAME = "PokeV-Recomp-windows-x64.zip";
 static const char *SHA256SUMS_NAME = "SHA256SUMS";
 
 static pthread_mutex_t g_upd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -53,6 +61,7 @@ static bool g_flag_play = false;
 static bool g_flag_prepare = false;
 
 static std::string g_staged_path;
+static std::string g_manifest_path;
 static std::string g_backup_path;
 static std::string g_lock_path;
 
@@ -305,6 +314,8 @@ struct ParsedObj {
     std::string body;
     std::string linux_asset_url;
     uint64_t linux_asset_size = 0;
+    std::string windows_asset_url;
+    uint64_t windows_asset_size = 0;
     std::string sha256sums_url;
 };
 
@@ -355,6 +366,9 @@ static ParsedObj parse_release_object(const std::string &s, size_t &pos) {
                     if (a.name == LINUX_ASSET_NAME && is_https_url(a.url)) {
                         obj.linux_asset_url = a.url;
                         obj.linux_asset_size = a.size;
+                    } else if (a.name == WINDOWS_ASSET_NAME && is_https_url(a.url)) {
+                        obj.windows_asset_url = a.url;
+                        obj.windows_asset_size = a.size;
                     } else if (a.name == SHA256SUMS_NAME && is_https_url(a.url)) {
                         obj.sha256sums_url = a.url;
                     }
@@ -400,6 +414,8 @@ UpdaterParseResult updater_parse_release_json_opts(const std::string &json, bool
             res.body = o.body;
             res.linux_asset_url = o.linux_asset_url;
             res.linux_asset_size = o.linux_asset_size;
+            res.windows_asset_url = o.windows_asset_url;
+            res.windows_asset_size = o.windows_asset_size;
             res.sha256sums_url = o.sha256sums_url;
         }
     };
@@ -485,6 +501,61 @@ std::string updater_file_sha256(const std::string &path) {
     return sha.finish();
 }
 
+bool updater_validate_windows_extracted_dir(const std::string &dir, std::string &out_error) {
+    out_error.clear();
+    std::error_code ec;
+    fs::path root = fs::u8path(dir);
+    if (!fs::is_directory(root, ec)) {
+        out_error = "Extracted update directory does not exist.";
+        return false;
+    }
+
+    static const char *const k_required[] = {
+        "PokeV-Recomp.exe",
+        "PokeV-Recomp-updater.exe",
+        "za-default.ini",
+        "recomplauncher.json",
+        "gamelib-src/gamelib_entry.c",
+        "zaimport/zaimport.exe",
+        "zig/zig.exe",
+        "lasgen/lasgen.exe",
+        "zaprompts/zaprompts.exe",
+    };
+    for (const char *req : k_required) {
+        fs::path p = root / fs::u8path(req);
+        if (!fs::is_regular_file(p, ec) || fs::file_size(p, ec) == 0 || ec) {
+            out_error = std::string("Extracted ZIP is missing required file: ") + req;
+            return false;
+        }
+    }
+
+    bool has_dll = false;
+    for (const auto &ent : fs::directory_iterator(root, ec)) {
+        if (!ent.is_regular_file(ec)) continue;
+        std::string ext = ent.path().extension().u8string();
+        for (char &c : ext) c = (char)tolower((unsigned char)c);
+        if (ext == ".dll") {
+            has_dll = true;
+            break;
+        }
+    }
+    if (!has_dll) {
+        out_error = "Extracted ZIP is missing required runtime DLLs.";
+        return false;
+    }
+
+    static const char *const k_forbidden[] = {
+        "larecomp.ini", "recompdata", "save", "extracted", "mods", "rando", "cache", "data_root.txt"
+    };
+    for (const char *bad : k_forbidden) {
+        if (fs::exists(root / fs::u8path(bad), ec)) {
+            out_error = std::string("Extracted ZIP contains protected user-data entry: ") + bad;
+            return false;
+        }
+    }
+    return true;
+}
+
 UpdaterInstallKind updater_detect_install_kind(std::string &out_target_path, std::string &out_reason) {
     out_target_path.clear();
     out_reason.clear();
@@ -519,8 +590,65 @@ UpdaterInstallKind updater_detect_install_kind(std::string &out_target_path, std
         return UPD_INSTALL_LINUX_APPIMAGE_RO;
     }
     return UPD_INSTALL_LINUX_APPIMAGE;
+#elif defined(_WIN32)
+    std::string install_dir;
+    if (const char *test_dir = getenv("LARECOMP_TEST_WIN_INSTALL_DIR")) {
+        if (*test_dir) install_dir = test_dir;
+    }
+    if (install_dir.empty()) {
+#ifndef LARECOMP_ZIP_BUILD
+        out_reason = "In-app update is only enabled for official Windows release ZIP builds.";
+        return UPD_INSTALL_UNSUPPORTED;
 #else
-    out_reason = "In-app installation is currently supported only for Linux AppImage.";
+        std::wstring wexe(32768, L'\0');
+        DWORD n = GetModuleFileNameW(nullptr, wexe.data(), (DWORD)wexe.size());
+        if (n == 0 || n >= wexe.size()) {
+            out_reason = "Unable to locate PokeV-Recomp.exe path.";
+            return UPD_INSTALL_UNSUPPORTED;
+        }
+        wexe.resize(n);
+        fs::path exe_p(wexe);
+        install_dir = exe_p.parent_path().u8string();
+#endif
+    }
+
+    std::error_code ec;
+    fs::path dir_p = fs::u8path(install_dir);
+    if (!fs::is_directory(dir_p, ec)) {
+        out_reason = "Installation folder does not exist.";
+        return UPD_INSTALL_UNSUPPORTED;
+    }
+
+    // Verify official Windows ZIP layout markers before allowing any automated replacement
+    static const char *const k_markers[] = {
+        "PokeV-Recomp.exe",
+        "PokeV-Recomp-updater.exe",
+        "za-default.ini",
+        "recomplauncher.json",
+        "gamelib-src/gamelib_entry.c",
+    };
+    for (const char *m : k_markers) {
+        if (!fs::is_regular_file(dir_p / fs::u8path(m), ec)) {
+            out_reason = "Installation layout could not be verified as a release ZIP; update manually from GitHub.";
+            return UPD_INSTALL_UNSUPPORTED;
+        }
+    }
+
+    out_target_path = dir_p.u8string();
+
+    // Probe NTFS write permission without elevating privileges
+    fs::path probe = dir_p / (".PokeV-Recomp.wtest." + std::to_string((unsigned long)_getpid()));
+    std::wstring wprobe = probe.wstring();
+    HANDLE hw = CreateFileW(wprobe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (hw == INVALID_HANDLE_VALUE) {
+        out_reason = "PokeV-Recomp folder is not writable (e.g. Program Files). Move it to a user folder or update manually from GitHub.";
+        return UPD_INSTALL_WINDOWS_ZIP_RO;
+    }
+    CloseHandle(hw);
+    return UPD_INSTALL_WINDOWS_ZIP;
+#else
+    out_reason = "In-app installation is supported on Linux AppImage and Windows ZIP builds.";
     return UPD_INSTALL_UNSUPPORTED;
 #endif
 }
@@ -639,7 +767,67 @@ static void cleanup_on_boot_locked(const std::string &data_root, const std::stri
         }
     }
 #else
-    (void)target_path;
+    if (!target_path.empty()) {
+        std::error_code ec;
+        fs::path dir = fs::u8path(target_path);
+        fs::path bak_dir = dir / ".PokeV-Recomp.update.bak";
+        fs::path prog_marker = dir / ".PokeV-Recomp.update-in-progress";
+        fs::path err_marker = dir / ".PokeV-Recomp.update-error.txt";
+        fs::path exe_p = dir / "PokeV-Recomp.exe";
+
+        // Interrupted replacement (reboot/crash): restore from backup directory if needed
+        if (fs::is_directory(bak_dir, ec)) {
+            if (fs::exists(prog_marker, ec) || !fs::exists(exe_p, ec)) {
+                for (const auto &ent : fs::recursive_directory_iterator(bak_dir, ec)) {
+                    if (!ent.is_regular_file(ec)) continue;
+                    fs::path rel = fs::relative(ent.path(), bak_dir, ec);
+                    if (ec || rel.empty()) continue;
+                    fs::path dst = dir / rel;
+                    fs::create_directories(dst.parent_path(), ec);
+                    MoveFileExW(ent.path().wstring().c_str(), dst.wstring().c_str(),
+                                MOVEFILE_REPLACE_EXISTING);
+                }
+                fs::remove(prog_marker, ec);
+            }
+            fs::remove_all(bak_dir, ec);
+        } else {
+            fs::remove(prog_marker, ec);
+        }
+
+        if (fs::is_regular_file(err_marker, ec)) {
+            std::string prev_err = read_file_capped(err_marker.u8string(), 1024);
+            while (!prev_err.empty() && (prev_err.back() == '\n' || prev_err.back() == '\r')) prev_err.pop_back();
+            if (!prev_err.empty()) g_snap.install_error = prev_err;
+            fs::remove(err_marker, ec);
+        }
+
+        fs::path lock = dir / ".PokeV-Recomp.update.lock";
+        if (FILE *lf = fopen(lock.u8string().c_str(), "rb")) {
+            unsigned long pid = 0;
+            bool stale = false;
+            if (fscanf(lf, "%lu", &pid) == 1 && pid > 0) {
+                if (pid == (unsigned long)_getpid()) {
+                    stale = true;
+                } else {
+                    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+                    if (!hp) {
+                        if (GetLastError() == ERROR_INVALID_PARAMETER) stale = true;
+                    } else {
+                        DWORD code = 0;
+                        if (GetExitCodeProcess(hp, &code) && code != STILL_ACTIVE) stale = true;
+                        CloseHandle(hp);
+                    }
+                }
+            } else {
+                stale = true;
+            }
+            fclose(lf);
+            if (stale) fs::remove(lock, ec);
+        }
+
+        fs::remove_all(dir / ".update-staging", ec);
+        fs::remove(dir / ".PokeV-Recomp.updater.tmp.exe", ec);
+    }
 #endif
     if (!data_root.empty()) {
         std::string note = data_root + "/cache/_updated.txt";
@@ -686,6 +874,8 @@ void updater_configure(const char *current_version, const char *data_root,
         }
     }
 #endif
+    g_snap.install_error.clear();
+    g_snap.updated_from_tag.clear();
     cleanup_on_boot_locked(g_data_root, recovery_tgt);
     if (tgt.empty() && !recovery_tgt.empty()) {
         // Re-detect in case boot recovery restored the AppImage from .bak
@@ -694,10 +884,10 @@ void updater_configure(const char *current_version, const char *data_root,
     g_snap.install_target_path = tgt;
     g_snap.install_reason = reason;
     g_snap.install_state = UPD_INST_IDLE;
-    g_snap.install_error.clear();
     g_snap.downloaded_bytes = 0;
     g_snap.total_bytes = 0;
     g_staged_path.clear();
+    g_manifest_path.clear();
     g_backup_path.clear();
     g_lock_path.clear();
     pthread_mutex_unlock(&g_upd_lock);
@@ -721,7 +911,8 @@ static void set_check_result(UpdaterCheckState st, const std::string &tag,
                              const std::string &url, const std::string &notes,
                              const std::string &linux_url, uint64_t linux_size,
                              const std::string &sums_url, const std::string &err,
-                             bool prerelease_ch = false) {
+                             bool prerelease_ch = false,
+                             const std::string &win_url = "", uint64_t win_size = 0) {
     if (g_shutting_down.load()) return;
     pthread_mutex_lock(&g_upd_lock);
     if (!g_shutting_down.load()) {
@@ -731,6 +922,8 @@ static void set_check_result(UpdaterCheckState st, const std::string &tag,
         g_snap.notes = notes;
         g_snap.linux_asset_url = linux_url;
         g_snap.linux_asset_size = linux_size;
+        g_snap.windows_asset_url = win_url;
+        g_snap.windows_asset_size = win_size;
         g_snap.sha256sums_url = sums_url;
         g_snap.error = err;
         g_snap.is_prerelease_channel = prerelease_ch;
@@ -795,10 +988,11 @@ static bool run_curl_to_file(const std::string &curl, const std::string &ua,
         rc = plat_proc_wait(p, false);
         if (rc >= 0) break;
         if (cancel_flag) {
-            struct stat st{};
-            if (stat(out_path.c_str(), &st) == 0 && st.st_size >= 0) {
+            std::error_code ec;
+            uintmax_t fsz = fs::file_size(fs::u8path(out_path), ec);
+            if (!ec) {
                 pthread_mutex_lock(&g_upd_lock);
-                g_snap.downloaded_bytes = (uint64_t)st.st_size;
+                g_snap.downloaded_bytes = (uint64_t)fsz;
                 pthread_mutex_unlock(&g_upd_lock);
             }
         }
@@ -916,11 +1110,11 @@ static void *check_thread(void *) {
                 parsed.tag_name.c_str(), cur_ver.c_str());
         set_check_result(UPD_CHK_AVAILABLE, parsed.tag_name, parsed.html_url, parsed.body,
                          parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "",
-                         prerelease_ch);
+                         prerelease_ch, parsed.windows_asset_url, parsed.windows_asset_size);
     } else {
         set_check_result(UPD_CHK_UP_TO_DATE, parsed.tag_name, parsed.html_url, parsed.body,
                          parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "",
-                         prerelease_ch);
+                         prerelease_ch, parsed.windows_asset_url, parsed.windows_asset_size);
     }
 
     g_upd_running = false;
@@ -979,7 +1173,256 @@ static void set_install_failed(const std::string &err) {
 
 static void *install_thread(void *) {
 #ifdef _WIN32
-    set_install_failed("Linux AppImage updater is not supported on Windows.");
+    pthread_mutex_lock(&g_upd_lock);
+    std::string cur_ver = g_snap.current_version;
+    std::string tag = g_snap.latest_tag;
+    std::string target = g_snap.install_target_path;
+    std::string asset_url = g_snap.windows_asset_url;
+    std::string sums_url = g_snap.sha256sums_url;
+    uint64_t expected_size = g_snap.windows_asset_size;
+    UpdaterInstallKind kind = g_snap.install_kind;
+    pthread_mutex_unlock(&g_upd_lock);
+
+    if (const char *ov_zip = getenv("LARECOMP_UPDATE_WINZIP")) {
+        asset_url = (strncmp(ov_zip, "http", 4) == 0 || strncmp(ov_zip, "file:", 5) == 0)
+                        ? std::string(ov_zip)
+                        : std::string("file:") + ov_zip;
+    }
+    if (const char *ov_sums = getenv("LARECOMP_UPDATE_SHA256SUMS")) {
+        sums_url = (strncmp(ov_sums, "http", 4) == 0 || strncmp(ov_sums, "file:", 5) == 0)
+                       ? std::string(ov_sums)
+                       : std::string("file:") + ov_sums;
+    }
+
+    if (kind != UPD_INSTALL_WINDOWS_ZIP || target.empty()) {
+        set_install_failed("Installation is not a writable Windows release ZIP folder.");
+        g_inst_running = false;
+        return NULL;
+    }
+    if (asset_url.empty() || sums_url.empty()) {
+        set_install_failed("Release is missing Windows ZIP or SHA256SUMS asset.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    std::error_code ec;
+    fs::path dir = fs::u8path(target);
+    fs::path lock_p = dir / ".PokeV-Recomp.update.lock";
+    fs::path staging_root = dir / ".update-staging";
+    fs::path extracted_dir = staging_root / "extracted";
+    fs::path zip_part = staging_root / "update.zip.part";
+    fs::path sums_part = staging_root / "SHA256SUMS.part";
+    fs::path status_path = staging_root / "curl.status";
+    fs::path manifest_p = staging_root / "manifest.txt";
+    fs::path backup_dir = dir / ".PokeV-Recomp.update.bak";
+
+    // Prevent simultaneous updaters on the same installation directory
+    auto try_acquire_lock = [&]() -> HANDLE {
+        return CreateFileW(lock_p.wstring().c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    };
+    HANDLE hLock = try_acquire_lock();
+    if (hLock == INVALID_HANDLE_VALUE) {
+        if (FILE *lf = fopen(lock_p.u8string().c_str(), "rb")) {
+            unsigned long pid = 0;
+            bool dead = false;
+            if (fscanf(lf, "%lu", &pid) == 1 && pid > 0) {
+                HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+                if (!hp) {
+                    if (GetLastError() == ERROR_INVALID_PARAMETER) dead = true;
+                } else {
+                    DWORD code = 0;
+                    if (GetExitCodeProcess(hp, &code) && code != STILL_ACTIVE) dead = true;
+                    CloseHandle(hp);
+                }
+            } else {
+                dead = true;
+            }
+            fclose(lf);
+            if (dead) {
+                fs::remove(lock_p, ec);
+                hLock = try_acquire_lock();
+            }
+        }
+        if (hLock == INVALID_HANDLE_VALUE) {
+            set_install_failed("Another update is already in progress for this installation.");
+            g_inst_running = false;
+            return NULL;
+        }
+    }
+    char pid_buf[32];
+    int plen = snprintf(pid_buf, sizeof pid_buf, "%lu\n", (unsigned long)_getpid());
+    if (plen > 0) {
+        DWORD wr = 0;
+        WriteFile(hLock, pid_buf, (DWORD)plen, &wr, nullptr);
+    }
+    CloseHandle(hLock);
+
+    auto cleanup_temp = [&](bool remove_lock) {
+        fs::remove_all(staging_root, ec);
+        if (remove_lock) fs::remove(lock_p, ec);
+    };
+
+    // Disk space check (ZIP + extracted tree + backup headroom)
+    uint64_t avail_bytes = 0;
+    if (const char *sim_free = getenv("LARECOMP_UPDATE_MIN_FREE_BYTES")) {
+        avail_bytes = strtoull(sim_free, NULL, 10);
+    } else {
+        ULARGE_INTEGER free_avail{}, total_b{}, total_free{};
+        if (GetDiskFreeSpaceExW(dir.wstring().c_str(), &free_avail, &total_b, &total_free)) {
+            avail_bytes = free_avail.QuadPart;
+        } else {
+            cleanup_temp(true);
+            set_install_failed("Unable to check available disk space.");
+            g_inst_running = false;
+            return NULL;
+        }
+    }
+    uint64_t needed = expected_size > 0 ? (expected_size * 3ULL + (64ULL << 20)) : (512ULL << 20);
+    if (avail_bytes < needed) {
+        cleanup_temp(true);
+        set_install_failed("Not enough free disk space in the PokeV-Recomp folder.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    fs::remove_all(staging_root, ec);
+    fs::create_directories(staging_root, ec);
+    if (ec) {
+        cleanup_temp(true);
+        set_install_failed("Failed to create staging directory.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    std::string curl = updater_find_curl();
+    if (curl.empty() && (asset_url.compare(0, 5, "http:") == 0 || asset_url.compare(0, 6, "https:") == 0)) {
+        cleanup_temp(true);
+        set_install_failed("curl executable not found.");
+        g_inst_running = false;
+        return NULL;
+    }
+    std::string ua = "PokeV-Recomp/" + (cur_ver.empty() ? std::string("unknown") : cur_ver);
+
+    // 1. Download SHA256SUMS
+    int http_code = 0;
+    bool cancelled = false;
+    std::string err;
+    if (!run_curl_to_file(curl, ua, sums_url, sums_part.u8string(), status_path.u8string(), 30,
+                          &g_cancel_install, http_code, cancelled, err) ||
+        http_code < 200 || http_code >= 300) {
+        cleanup_temp(true);
+        if (cancelled) {
+            pthread_mutex_lock(&g_upd_lock);
+            g_snap.install_state = UPD_INST_CANCELLED;
+            pthread_mutex_unlock(&g_upd_lock);
+        } else {
+            set_install_failed(err.empty() ? ("Failed to download SHA256SUMS (HTTP " + std::to_string(http_code) + ").") : err);
+        }
+        g_inst_running = false;
+        return NULL;
+    }
+
+    std::string sums_text = read_file_capped(sums_part.u8string(), 64u << 10);
+    std::string expected_sha = updater_parse_sha256sums(sums_text, WINDOWS_ASSET_NAME);
+    fs::remove(sums_part, ec);
+    if (expected_sha.empty()) {
+        cleanup_temp(true);
+        set_install_failed("SHA256SUMS does not contain a valid checksum for the Windows ZIP.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    // 2. Download Windows ZIP
+    if (!run_curl_to_file(curl, ua, asset_url, zip_part.u8string(), status_path.u8string(), 1800,
+                          &g_cancel_install, http_code, cancelled, err) ||
+        http_code < 200 || http_code >= 300) {
+        cleanup_temp(true);
+        if (cancelled) {
+            pthread_mutex_lock(&g_upd_lock);
+            g_snap.install_state = UPD_INST_CANCELLED;
+            pthread_mutex_unlock(&g_upd_lock);
+        } else {
+            set_install_failed(err.empty() ? ("Download failed (HTTP " + std::to_string(http_code) + ").") : err);
+        }
+        g_inst_running = false;
+        return NULL;
+    }
+
+    if (g_cancel_install.load() || g_shutting_down.load()) {
+        cleanup_temp(true);
+        pthread_mutex_lock(&g_upd_lock);
+        g_snap.install_state = UPD_INST_CANCELLED;
+        pthread_mutex_unlock(&g_upd_lock);
+        g_inst_running = false;
+        return NULL;
+    }
+
+    // 3. Verify size and SHA-256
+    pthread_mutex_lock(&g_upd_lock);
+    g_snap.install_state = UPD_INST_VERIFYING;
+    pthread_mutex_unlock(&g_upd_lock);
+
+    uintmax_t zsz = fs::file_size(zip_part, ec);
+    if (ec || zsz == 0 || (expected_size > 0 && (uint64_t)zsz != expected_size)) {
+        cleanup_temp(true);
+        set_install_failed("Downloaded Windows ZIP size does not match release metadata.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    std::string got_sha = updater_file_sha256(zip_part.u8string());
+    if (got_sha.empty() || got_sha != expected_sha) {
+        cleanup_temp(true);
+        set_install_failed("SHA-256 checksum verification failed; installation aborted.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    // 4. Safe ZIP extraction & structure validation (never modifies install_dir)
+    WinZipExtractResult zres = updater_extract_zip_safe(
+        zip_part.u8string(), extracted_dir.u8string(), "PokeV-Recomp/");
+    fs::remove(zip_part, ec);
+    if (!zres.ok) {
+        cleanup_temp(true);
+        set_install_failed(zres.error.empty() ? "Failed to extract Windows update ZIP." : zres.error);
+        g_inst_running = false;
+        return NULL;
+    }
+
+    std::string val_err;
+    if (!updater_validate_windows_extracted_dir(extracted_dir.u8string(), val_err)) {
+        cleanup_temp(true);
+        set_install_failed(val_err);
+        g_inst_running = false;
+        return NULL;
+    }
+
+    FILE *mf = fopen(manifest_p.u8string().c_str(), "wb");
+    if (!mf) {
+        cleanup_temp(true);
+        set_install_failed("Failed to write staged update manifest.");
+        g_inst_running = false;
+        return NULL;
+    }
+    for (const auto &ent : zres.files) {
+        fprintf(mf, "%s\n", ent.rel_path.c_str());
+    }
+    if (fclose(mf) != 0) {
+        cleanup_temp(true);
+        set_install_failed("Failed to flush staged update manifest.");
+        g_inst_running = false;
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_upd_lock);
+    g_staged_path = extracted_dir.u8string();
+    g_manifest_path = manifest_p.u8string();
+    g_backup_path = backup_dir.u8string();
+    g_lock_path = lock_p.u8string();
+    g_snap.install_state = UPD_INST_STAGED;
+    pthread_mutex_unlock(&g_upd_lock);
+
     g_inst_running = false;
     return NULL;
 #else
@@ -1205,7 +1648,9 @@ void updater_start_install() {
     g_snap.install_state = UPD_INST_DOWNLOADING;
     g_snap.install_error.clear();
     g_snap.downloaded_bytes = 0;
-    g_snap.total_bytes = g_snap.linux_asset_size;
+    g_snap.total_bytes = (g_snap.install_kind == UPD_INSTALL_WINDOWS_ZIP)
+                             ? g_snap.windows_asset_size
+                             : g_snap.linux_asset_size;
     pthread_mutex_unlock(&g_upd_lock);
 
     if (join_old) pthread_join(old_t, NULL);
@@ -1232,7 +1677,92 @@ void updater_cancel_install() {
 
 bool updater_launch_external_apply_and_exit_ready() {
 #ifdef _WIN32
-    return false;
+    pthread_mutex_lock(&g_upd_lock);
+    UpdaterInstallState st = g_snap.install_state;
+    std::string target = g_snap.install_target_path;
+    std::string staged = g_staged_path;
+    std::string manifest = g_manifest_path;
+    std::string backup = g_backup_path;
+    std::string lock = g_lock_path;
+    std::string tag = g_snap.latest_tag;
+    std::string note_path = g_data_root.empty() ? "" : (g_data_root + "/cache/_updated.txt");
+    pthread_mutex_unlock(&g_upd_lock);
+
+    if (st != UPD_INST_STAGED || target.empty() || staged.empty() || manifest.empty()) return false;
+
+    std::error_code ec;
+    fs::path dir = fs::u8path(target);
+    fs::path src_helper = dir / "PokeV-Recomp-updater.exe";
+    fs::path tmp_helper = dir / ".PokeV-Recomp.updater.tmp.exe";
+    if (!fs::copy_file(src_helper, tmp_helper, fs::copy_options::overwrite_existing, ec)) {
+        set_install_failed("Failed to stage Windows update helper executable.");
+        return false;
+    }
+
+    HANDLE hParentInherit = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                         &hParentInherit, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        fs::remove(tmp_helper, ec);
+        set_install_failed("Failed to duplicate process handle for Windows update helper.");
+        return false;
+    }
+
+    auto quote_arg = [](const std::wstring &a) -> std::wstring {
+        std::wstring out = L"\"";
+        size_t bs = 0;
+        for (wchar_t c : a) {
+            if (c == L'\\') {
+                ++bs;
+            } else if (c == L'"') {
+                out.append(bs * 2 + 1, L'\\');
+                out.push_back(L'"');
+                bs = 0;
+            } else {
+                out.append(bs, L'\\');
+                out.push_back(c);
+                bs = 0;
+            }
+        }
+        out.append(bs * 2, L'\\');
+        out.push_back(L'"');
+        return out;
+    };
+
+    auto to_w = [](const std::string &u8) -> std::wstring {
+        if (u8.empty()) return L"";
+        return fs::u8path(u8).wstring();
+    };
+
+    std::wstring cmd = quote_arg(tmp_helper.wstring()) + L" " +
+                       std::to_wstring((unsigned long)GetCurrentProcessId()) + L" " +
+                       std::to_wstring((unsigned long long)(uintptr_t)hParentInherit) + L" " +
+                       quote_arg(to_w(target)) + L" " +
+                       quote_arg(to_w(staged)) + L" " +
+                       quote_arg(to_w(manifest)) + L" " +
+                       quote_arg(to_w(backup)) + L" " +
+                       quote_arg(to_w(lock)) + L" " +
+                       quote_arg(to_w(note_path)) + L" " +
+                       quote_arg(to_w(tag)) + L" 15000 1";
+
+    pthread_mutex_lock(&g_upd_lock);
+    g_snap.install_state = UPD_INST_APPLYING;
+    pthread_mutex_unlock(&g_upd_lock);
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(tmp_helper.wstring().c_str(), cmd.data(), nullptr, nullptr, TRUE,
+                             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                             nullptr, dir.wstring().c_str(), &si, &pi);
+    CloseHandle(hParentInherit);
+    if (!ok) {
+        fs::remove(tmp_helper, ec);
+        set_install_failed("Failed to launch Windows update helper process.");
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
 #else
     pthread_mutex_lock(&g_upd_lock);
     UpdaterInstallState st = g_snap.install_state;

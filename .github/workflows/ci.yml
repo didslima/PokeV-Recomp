@@ -241,7 +241,7 @@ jobs:
           CLEAN_PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -i "Program Files/LLVM" | grep -v -i "Windows Kits" | tr '\n' ':')
           export PATH="$CLEAN_PATH"
           bash tools/build_deps_windows.sh
-          make -j"$(nproc)" B=build/win DEPS="$PWD/build/deps-win" RELEASE=1 build/win/PokeV-Recomp.exe
+          make -j"$(nproc)" B=build/win DEPS="$PWD/build/deps-win" RELEASE=1 build/win/PokeV-Recomp.exe build/win/PokeV-Recomp-updater.exe
           ! nm build/win/PokeV-Recomp.exe | grep -q ' f_70'
 
       - name: Build macOS Executable

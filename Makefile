@@ -237,6 +237,12 @@ $(B)/rt/ui/%.o: runtime/ui/%.cpp $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+ifeq ($(PLATFORM),windows)
+$(B)/PokeV-Recomp-updater.exe: tools/win_updater_helper.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -O2 -std=c++17 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -municode -Wl,--subsystem,windows -static $< -lkernel32 -o $@
+endif
+
 $(B)/imgui/%.o: $(IMGUI)/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@

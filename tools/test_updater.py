@@ -57,6 +57,7 @@ void plat_proc_kill(PlatProc p) {
 }
 
 #include "ui/updater.h"
+#include "ui/win_zip.h"
 
 namespace fs = std::filesystem;
 
@@ -438,7 +439,170 @@ int main() {
         printf("ok   markdown parser & prerelease channel flag\n");
     }
 
-    printf("PASS: updater phase A + B checks\n");
+    // 13. Phase C: Windows ZIP asset parsing, path validation & safe extraction (cross-platform)
+    {
+        assert(r.windows_asset_url == "https://github.com/x/win.zip");
+        assert(r.windows_asset_size == 999);
+
+        std::string rel, err;
+        bool is_dir = false;
+        assert(updater_validate_zip_entry_path("PokeV-Recomp/PokeV-Recomp.exe", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!is_dir && rel == "PokeV-Recomp.exe");
+        assert(updater_validate_zip_entry_path("PokeV-Recomp/zaimport/zaimport.exe", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!is_dir && rel == "zaimport/zaimport.exe");
+
+        assert(!updater_validate_zip_entry_path("../evil.dll", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/../../evil.dll", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("/abs/evil.dll", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("C:\\evil.dll", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/CON.txt", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/bad.txt ", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/bad.", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/larecomp.ini", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/save/slot.bin", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/extracted/exefs/main", "PokeV-Recomp/", rel, is_dir, err));
+        assert(!updater_validate_zip_entry_path("PokeV-Recomp/mods/m.txt", "PokeV-Recomp/", rel, is_dir, err));
+
+        const char *zip_good = getenv("LARECOMP_TEST_ZIP_GOOD");
+        const char *zip_slip = getenv("LARECOMP_TEST_ZIP_SLIP");
+        const char *zip_dup = getenv("LARECOMP_TEST_ZIP_DUP");
+        const char *zip_sym = getenv("LARECOMP_TEST_ZIP_SYM");
+        const char *zip_badcrc = getenv("LARECOMP_TEST_ZIP_BADCRC");
+        const char *zip_userdata = getenv("LARECOMP_TEST_ZIP_USERDATA");
+        assert(zip_good && zip_slip && zip_dup && zip_sym && zip_badcrc && zip_userdata);
+
+        std::string ztmp = std::string(getenv("LARECOMP_TEST_TMPDIR")) + "/zextract";
+        WinZipExtractResult gres = updater_extract_zip_safe(zip_good, ztmp + "/good", "PokeV-Recomp/");
+        assert(gres.ok);
+        std::string verr;
+        assert(updater_validate_windows_extracted_dir(ztmp + "/good", verr));
+
+        assert(!updater_extract_zip_safe(zip_slip, ztmp + "/slip", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_dup, ztmp + "/dup", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_sym, ztmp + "/sym", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_badcrc, ztmp + "/badcrc", "PokeV-Recomp/").ok);
+        assert(!updater_extract_zip_safe(zip_userdata, ztmp + "/userdata", "PokeV-Recomp/").ok);
+        printf("ok   windows zip asset parsing, path traversal, dup/symlink/crc & structure validation\n");
+    }
+
+#ifdef _WIN32
+    // 14. Phase C (Windows): Install detection, download/SHA256/staging, lockfile, low disk & boot recovery
+    {
+        std::string tmp = getenv("LARECOMP_TEST_TMPDIR");
+        std::string win_dir = tmp + "\\Win Space 'Install'";
+        fs::create_directories(win_dir + "\\gamelib-src");
+        fs::create_directories(win_dir + "\\zaimport");
+        fs::create_directories(win_dir + "\\zig");
+        fs::create_directories(win_dir + "\\lasgen");
+        fs::create_directories(win_dir + "\\zaprompts");
+        fs::create_directories(win_dir + "\\save\\save_0");
+        fs::create_directories(win_dir + "\\mods");
+        fs::create_directories(win_dir + "\\extracted");
+
+        auto wbytes = [](const std::string &p, const std::string &d) {
+            FILE *f = fopen(p.c_str(), "wb");
+            assert(f);
+            fwrite(d.data(), 1, d.size(), f);
+            fclose(f);
+        };
+        auto rbytes = [](const std::string &p) -> std::string {
+            FILE *f = fopen(p.c_str(), "rb");
+            if (!f) return "";
+            std::string s;
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+            fclose(f);
+            return s;
+        };
+
+        wbytes(win_dir + "\\PokeV-Recomp.exe", "old-exe");
+        wbytes(win_dir + "\\PokeV-Recomp-updater.exe", "old-upd");
+        wbytes(win_dir + "\\SDL3.dll", "old-sdl3");
+        wbytes(win_dir + "\\za-default.ini", "old-def");
+        wbytes(win_dir + "\\recomplauncher.json", "{}");
+        wbytes(win_dir + "\\gamelib-src\\gamelib_entry.c", "// old");
+        wbytes(win_dir + "\\zaimport\\zaimport.exe", "old-zai");
+        wbytes(win_dir + "\\zig\\zig.exe", "old-zig");
+        wbytes(win_dir + "\\lasgen\\lasgen.exe", "old-las");
+        wbytes(win_dir + "\\zaprompts\\zaprompts.exe", "old-zap");
+        wbytes(win_dir + "\\save\\save_0\\savedata0.bin", "my-precious-save");
+        wbytes(win_dir + "\\larecomp.ini", "user-setting=1\n");
+        wbytes(win_dir + "\\mods\\cool.mod", "mod-data");
+        wbytes(win_dir + "\\extracted\\romfs.bin", "romfs-data");
+
+        std::string dtgt, dreason;
+        set_env("LARECOMP_TEST_WIN_INSTALL_DIR", win_dir.c_str());
+        assert(updater_detect_install_kind(dtgt, dreason) == UPD_INSTALL_WINDOWS_ZIP);
+
+        set_env("RECOMPLAUNCHER_DATA", "C:\\RL");
+        assert(updater_detect_install_kind(dtgt, dreason) == UPD_INSTALL_RECOMPLAUNCHER);
+        set_env("RECOMPLAUNCHER_DATA", nullptr);
+
+        // Staged install with valid ZIP + SHA256SUMS
+        const char *zip_good = getenv("LARECOMP_TEST_ZIP_GOOD");
+        std::string zsha = updater_file_sha256(zip_good);
+        std::string zsz = std::to_string((unsigned long long)fs::file_size(zip_good));
+        std::string sums_f = tmp + "\\win_SHA256SUMS";
+        wbytes(sums_f, zsha + "  PokeV-Recomp-windows-x64.zip\n");
+
+        std::string win_json = std::string(R"({"tag_name":"v0.2.0","draft":false,"prerelease":false,)") +
+            R"("html_url":"https://github.com/x/v020","body":"Win update",)" +
+            R"("assets":[{"name":"PokeV-Recomp-windows-x64.zip","size":)" + zsz +
+            R"(,"browser_download_url":"https://github.com/x/win.zip"},)" +
+            R"({"name":"SHA256SUMS","size":100,"browser_download_url":"https://github.com/x/SHA256SUMS"}]})";
+
+        set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
+        set_env("LARECOMP_UPDATE_JSON", win_json.c_str());
+        set_env("LARECOMP_UPDATE_WINZIP", zip_good);
+        set_env("LARECOMP_UPDATE_SHA256SUMS", sums_f.c_str());
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        updater_start_check(true);
+        UpdaterSnapshot ws = wait_check_done();
+        assert(ws.state == UPD_CHK_AVAILABLE && ws.install_kind == UPD_INSTALL_WINDOWS_ZIP);
+
+        updater_start_install();
+        ws = wait_install_done();
+        assert(ws.install_state == UPD_INST_STAGED);
+        assert(fs::exists(win_dir + "\\.update-staging\\manifest.txt"));
+        assert(rbytes(win_dir + "\\save\\save_0\\savedata0.bin") == "my-precious-save");
+        assert(rbytes(win_dir + "\\larecomp.ini") == "user-setting=1\n");
+
+        // Wrong SHA256 rejects install
+        wbytes(sums_f, std::string(64, '0') + "  PokeV-Recomp-windows-x64.zip\n");
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        updater_start_check(true);
+        wait_check_done();
+        updater_start_install();
+        ws = wait_install_done();
+        assert(ws.install_state == UPD_INST_FAILED);
+
+        // Low disk space rejects install
+        wbytes(sums_f, zsha + "  PokeV-Recomp-windows-x64.zip\n");
+        set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", "1024");
+        updater_start_install();
+        ws = wait_install_done();
+        assert(ws.install_state == UPD_INST_FAILED);
+        set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", nullptr);
+
+        // Boot recovery restores interrupted update from .PokeV-Recomp.update.bak
+        fs::create_directories(win_dir + "\\.PokeV-Recomp.update.bak");
+        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\PokeV-Recomp.exe", "restored-exe");
+        wbytes(win_dir + "\\.PokeV-Recomp.update-in-progress", "v0.2.0");
+        wbytes(win_dir + "\\.PokeV-Recomp.update-error.txt", "Simulated rollback notice");
+        fs::remove(win_dir + "\\PokeV-Recomp.exe");
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        ws = updater_get_snapshot();
+        assert(rbytes(win_dir + "\\PokeV-Recomp.exe") == "restored-exe");
+        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
+        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
+        assert(ws.install_error == "Simulated rollback notice");
+        set_env("LARECOMP_TEST_WIN_INSTALL_DIR", nullptr);
+        printf("ok   windows install detection, staging, sha256, low-disk & boot recovery\n");
+    }
+#endif
+
+    printf("PASS: updater phase A + B + C checks\n");
     return 0;
 }
 '''
@@ -525,12 +689,228 @@ def test_external_helper_e2e():
         print("ok   external helper timeout preserves original AppImage and does not relaunch")
 
 
+def build_test_zips(tmp: Path) -> dict:
+    import zipfile
+
+    zips = {}
+    good = tmp / "good.zip"
+    long_rel = "PokeV-Recomp/docs/" + ("nested_subdir_" * 6) + "release_note & info (v2).txt"
+    good_files = {
+        "PokeV-Recomp/PokeV-Recomp.exe": b"new-exe-v0.2.0",
+        "PokeV-Recomp/PokeV-Recomp-updater.exe": b"new-upd-v0.2.0",
+        "PokeV-Recomp/SDL3.dll": b"new-sdl3-v0.2.0",
+        "PokeV-Recomp/za-default.ini": b"new-default-ini",
+        "PokeV-Recomp/recomplauncher.json": b'{"version":"0.2.0"}',
+        "PokeV-Recomp/gamelib-src/gamelib_entry.c": b"// new entry",
+        "PokeV-Recomp/zaimport/zaimport.exe": b"new-zaimport",
+        "PokeV-Recomp/zig/zig.exe": b"new-zig",
+        "PokeV-Recomp/lasgen/lasgen.exe": b"new-lasgen",
+        "PokeV-Recomp/zaprompts/zaprompts.exe": b"new-zaprompts",
+        long_rel: b"long path & special chars ok",
+    }
+    with zipfile.ZipFile(good, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in good_files.items():
+            zf.writestr(name, data)
+    zips["GOOD"] = str(good)
+
+    slip = tmp / "slip.zip"
+    with zipfile.ZipFile(slip, "w") as zf:
+        zf.writestr("../evil.dll", b"boom")
+    zips["SLIP"] = str(slip)
+
+    dup = tmp / "dup.zip"
+    with zipfile.ZipFile(dup, "w") as zf:
+        zf.writestr("PokeV-Recomp/Foo.dll", b"one")
+        zf.writestr("PokeV-Recomp/foo.dll", b"two")
+    zips["DUP"] = str(dup)
+
+    sym = tmp / "sym.zip"
+    with zipfile.ZipFile(sym, "w") as zf:
+        zi = zipfile.ZipInfo("PokeV-Recomp/link.dll")
+        zi.create_system = 3  # Unix
+        zi.external_attr = 0o120777 << 16  # S_IFLNK
+        zf.writestr(zi, b"C:\\Windows\\System32\\calc.exe")
+    zips["SYM"] = str(sym)
+
+    badcrc = tmp / "badcrc.zip"
+    with zipfile.ZipFile(badcrc, "w", compression=zipfile.ZIP_STORED) as zf:
+        zf.writestr("PokeV-Recomp/PokeV-Recomp.exe", b"ABCD1234")
+    raw = bytearray(badcrc.read_bytes())
+    idx = raw.find(b"ABCD1234")
+    assert idx != -1
+    raw[idx] ^= 0xff  # corrupt payload without updating CRC-32
+    badcrc.write_bytes(bytes(raw))
+    zips["BADCRC"] = str(badcrc)
+
+    userdata = tmp / "userdata.zip"
+    with zipfile.ZipFile(userdata, "w") as zf:
+        zf.writestr("PokeV-Recomp/larecomp.ini", b"overwrite-attempt=1")
+    zips["USERDATA"] = str(userdata)
+
+    return zips
+
+
+def test_windows_helper_e2e(cxx: str):
+    if os.name != "nt":
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        helper_exe = t / "PokeV-Recomp-updater.exe"
+        subprocess.run([
+            cxx, "-std=c++17", "-O2", "-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX",
+            "-municode", "-static",
+            str(ROOT / "tools" / "win_updater_helper.cpp"),
+            "-lkernel32", "-o", str(helper_exe),
+        ], cwd=ROOT, check=True)
+
+        # Build a tiny dummy child binary that exits after sleep or writes a marker on relaunch
+        dummy_cpp = t / "dummy_app.cpp"
+        dummy_cpp.write_text(
+            '#include <windows.h>\n'
+            '#include <cstdio>\n'
+            'int main(int argc, char **argv) {\n'
+            '  if (argc > 1 && argv[1][0] == \'w\') { Sleep(3000); return 0; }\n'
+            '  FILE *f = fopen("relaunched.txt", "wb");\n'
+            '  if (f) { fprintf(f, "v0.2.0\\n"); fclose(f); }\n'
+            '  return 0;\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        dummy_exe = t / "dummy_app.exe"
+        subprocess.run([cxx, "-O2", "-static", str(dummy_cpp), "-o", str(dummy_exe)], check=True)
+
+        inst = t / "Install With Spaces"
+        staged = inst / ".update-staging" / "extracted"
+        bak = inst / ".PokeV-Recomp.update.bak"
+        lock = inst / ".PokeV-Recomp.update.lock"
+        note = inst / "cache" / "_updated.txt"
+        manifest = inst / ".update-staging" / "manifest.txt"
+
+        def setup_install():
+            shutil.rmtree(inst, ignore_errors=True)
+            for sub in ["gamelib-src", "zaimport", "zig", "lasgen", "zaprompts", "save", "mods", "extracted"]:
+                (inst / sub).mkdir(parents=True, exist_ok=True)
+                (staged / sub).mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dummy_exe, inst / "PokeV-Recomp.exe")
+            (inst / "SDL3.dll").write_bytes(b"old-sdl3")
+            (inst / "obsolete.dll").write_bytes(b"old-obsolete")
+            (inst / ".PokeV-Recomp.app-manifest").write_text("PokeV-Recomp.exe\nSDL3.dll\nobsolete.dll\n", encoding="utf-8")
+            (inst / "za-default.ini").write_bytes(b"old-def")
+            (inst / "recomplauncher.json").write_bytes(b"{}")
+            (inst / "gamelib-src" / "gamelib_entry.c").write_bytes(b"old")
+            (inst / "zaimport" / "zaimport.exe").write_bytes(b"old")
+            (inst / "zig" / "zig.exe").write_bytes(b"old")
+            (inst / "lasgen" / "lasgen.exe").write_bytes(b"old")
+            (inst / "zaprompts" / "zaprompts.exe").write_bytes(b"old")
+            (inst / "save" / "slot.bin").write_bytes(b"user-save")
+            (inst / "larecomp.ini").write_bytes(b"user-ini=1\n")
+            (inst / "mods" / "m.pak").write_bytes(b"user-mod")
+            (inst / "extracted" / "romfs.bin").write_bytes(b"user-romfs")
+            (inst / "unknown_user.txt").write_bytes(b"keep-me")
+
+            shutil.copy2(dummy_exe, staged / "PokeV-Recomp.exe")
+            (staged / "SDL3.dll").write_bytes(b"new-sdl3")
+            (staged / "za-default.ini").write_bytes(b"new-def")
+            (staged / "recomplauncher.json").write_bytes(b'{"v":"0.2.0"}')
+            (staged / "gamelib-src" / "gamelib_entry.c").write_bytes(b"new")
+            (staged / "zaimport" / "zaimport.exe").write_bytes(b"new")
+            (staged / "zig" / "zig.exe").write_bytes(b"new")
+            (staged / "lasgen" / "lasgen.exe").write_bytes(b"new")
+            (staged / "zaprompts" / "zaprompts.exe").write_bytes(b"new")
+            manifest.write_text(
+                "\n".join([
+                    "PokeV-Recomp.exe", "SDL3.dll", "za-default.ini", "recomplauncher.json",
+                    "gamelib-src/gamelib_entry.c", "zaimport/zaimport.exe", "zig/zig.exe",
+                    "lasgen/lasgen.exe", "zaprompts/zaprompts.exe",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            lock.write_text("999999\n", encoding="utf-8")
+
+        # 1. Normal swap, obsolete file removal, user data preservation & relaunch
+        setup_install()
+        res = subprocess.run([
+            str(helper_exe), "0", "0", str(inst), str(staged), str(manifest),
+            str(bak), str(lock), str(note), "v0.2.0", "5000", "1",
+        ], timeout=15)
+        assert res.returncode == 0
+        import time
+        for _ in range(40):
+            if (inst / "relaunched.txt").is_file():
+                break
+            time.sleep(0.05)
+        assert (inst / "relaunched.txt").read_text(encoding="utf-8").strip() == "v0.2.0"
+        assert (inst / "SDL3.dll").read_bytes() == b"new-sdl3"
+        assert not (inst / "obsolete.dll").exists()
+        assert (inst / "save" / "slot.bin").read_bytes() == b"user-save"
+        assert (inst / "larecomp.ini").read_bytes() == b"user-ini=1\n"
+        assert (inst / "mods" / "m.pak").read_bytes() == b"user-mod"
+        assert (inst / "extracted" / "romfs.bin").read_bytes() == b"user-romfs"
+        assert (inst / "unknown_user.txt").read_bytes() == b"keep-me"
+        assert note.read_text(encoding="utf-8") == "v0.2.0"
+        assert not bak.exists()
+        assert not lock.exists()
+        print("ok   windows helper e2e (swap, user data preserved, obsolete cleaned, relaunch)")
+
+        # 2. Validation failure triggers automatic rollback
+        setup_install()
+        (staged / "zig" / "zig.exe").write_bytes(b"")  # empty critical file -> fails validation
+        res = subprocess.run([
+            str(helper_exe), "0", "0", str(inst), str(staged), str(manifest),
+            str(bak), str(lock), str(note), "v0.2.0", "5000", "0",
+        ], timeout=15)
+        assert res.returncode == 7
+        assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
+        assert (inst / "zig" / "zig.exe").read_bytes() == b"old"
+        assert (inst / ".PokeV-Recomp.update-error.txt").is_file()
+        assert (inst / "save" / "slot.bin").read_bytes() == b"user-save"
+        assert not bak.exists()
+        print("ok   windows helper validation failure rolls back cleanly")
+
+        # 3. Parent timeout preserves installation and does not relaunch
+        setup_install()
+        stubborn = subprocess.Popen([str(dummy_exe), "wait"])
+        try:
+            res = subprocess.run([
+                str(helper_exe), str(stubborn.pid), "0", str(inst), str(staged), str(manifest),
+                str(bak), str(lock), str(note), "v0.2.0", "200", "1",
+            ], timeout=10)
+            assert res.returncode == 1
+            assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
+            assert not (inst / "relaunched.txt").exists()
+            assert not lock.exists()
+        finally:
+            stubborn.terminate()
+            stubborn.wait(timeout=5)
+        print("ok   windows helper parent timeout preserves installation")
+
+        # 4. Locked file prevents update and preserves installation
+        setup_install()
+        with open(inst / "SDL3.dll", "r+b") as locked_f:
+            import msvcrt
+            msvcrt.locking(locked_f.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                res = subprocess.run([
+                    str(helper_exe), "0", "0", str(inst), str(staged), str(manifest),
+                    str(bak), str(lock), str(note), "v0.2.0", "500", "0",
+                ], timeout=15)
+                assert res.returncode == 3
+                assert (inst / ".PokeV-Recomp.update-error.txt").is_file()
+                assert not lock.exists()
+            finally:
+                locked_f.seek(0)
+                msvcrt.locking(locked_f.fileno(), msvcrt.LK_UNLCK, 1)
+        assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
+        print("ok   windows helper locked-file rejection preserves installation")
+
+
 def main():
     cxx = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
     assert cxx, "No C++ compiler found (set CXX or install clang++/g++)"
 
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(tmp)
+        zips = build_test_zips(t)
         src = t / "test_updater.cpp"
         exe = t / ("test_updater.exe" if os.name == "nt" else "test_updater")
         fake_curl = t / ("curl.exe" if os.name == "nt" else "curl")
@@ -543,6 +923,7 @@ def main():
             f"-I{ROOT / 'runtime'}",
             str(src),
             str(ROOT / "runtime" / "ui" / "updater.cpp"),
+            str(ROOT / "runtime" / "ui" / "win_zip.cpp"),
             "-pthread",
             "-o", str(exe),
         ]
@@ -551,10 +932,13 @@ def main():
         env["LARECOMP_TEST_FAKE_CURL"] = str(fake_curl)
         env["LARECOMP_TEST_TMPDIR"] = str(t)
         env["LARECOMP_TEST_HELLO_SHA"] = hashlib.sha256(b"hello world").hexdigest()
+        for k, v in zips.items():
+            env[f"LARECOMP_TEST_ZIP_{k}"] = v
         env["PATH"] = f"{t}{os.pathsep}{env.get('PATH', '')}"
         subprocess.run([str(exe)], cwd=ROOT, env=env, check=True)
 
     test_external_helper_e2e()
+    test_windows_helper_e2e(cxx)
 
 
 if __name__ == "__main__":

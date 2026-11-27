@@ -94,7 +94,7 @@ if [ ! -f build/deps-win/lib/libavcodec.dll.a ] && [ ! -f "$SRC_FF" ]; then
     done
 fi
 bash tools/build_deps_windows.sh
-make -j"$(nproc)" B=$B DEPS="$PWD/build/deps-win" RELEASE=1 GENARCH="$GENARCH" GENOPT="$GENOPT" $B/PokeV-Recomp.exe
+make -j"$(nproc)" B=$B DEPS="$PWD/build/deps-win" RELEASE=1 GENARCH="$GENARCH" GENOPT="$GENOPT" $B/PokeV-Recomp.exe $B/PokeV-Recomp-updater.exe
 ! nm $B/PokeV-Recomp.exe | grep -q ' f_70'  # (no game code inside)
 FLAGS=$(make -s --eval='pv: ; @echo $(strip $(filter-out -Iruntime,$(GENFLAGS)))' B=$B GENARCH="$GENARCH" GENOPT="$GENOPT" pv)
 bash tools/zig_slim.sh $FLAGS
@@ -105,6 +105,7 @@ dotnet publish tools/zaimport -c Release -r win-x64 --self-contained true -p:Pub
 # 5. the folder
 rm -rf build/dist-za && mkdir -p "$D/gamelib-src" "$D/zaimport"
 cp $B/PokeV-Recomp.exe $B/PokeV-Recomp.dll.a "$D/"
+cp $B/PokeV-Recomp-updater.exe "$D/"
 cp $B/PokeV-Recomp.dll.a "$D/lasrecomp.dll.a" 2>/dev/null || true
 cp -R build/helper/lasgen "$D/"
 cp -R build/helper/zaprompts "$D/"

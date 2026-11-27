@@ -3389,7 +3389,10 @@ extern "C" void launcher_run(const char *root) {
                     ImGui::Spacing();
 
                     if (ms.state == UPD_CHK_AVAILABLE) {
-                        if (ms.install_kind == UPD_INSTALL_LINUX_APPIMAGE) {
+                        bool is_win_zip = (ms.install_kind == UPD_INSTALL_WINDOWS_ZIP);
+                        bool is_lin_app = (ms.install_kind == UPD_INSTALL_LINUX_APPIMAGE);
+                        if (is_lin_app || is_win_zip) {
+                            const std::string &asset_url = is_win_zip ? ms.windows_asset_url : ms.linux_asset_url;
                             if (ms.install_state == UPD_INST_DOWNLOADING) {
                                 float frac = ms.total_bytes > 0 ? (float)ms.downloaded_bytes / (float)ms.total_bytes : 0.0f;
                                 if (frac > 1.0f) frac = 1.0f;
@@ -3407,8 +3410,11 @@ extern "C" void launcher_run(const char *root) {
                                                    TR("Verifying SHA-256 checksum...", "Verificando checksum SHA-256..."));
                             } else if (ms.install_state == UPD_INST_STAGED) {
                                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.85f, 1), "%s",
-                                                   TR("Verified (SHA-256 OK). Ready to replace AppImage and restart.",
-                                                      "Verificado (SHA-256 OK). Pronto para substituir o AppImage e reiniciar."));
+                                                   is_win_zip
+                                                       ? TR("Verified (SHA-256 OK). Ready to install update and restart.",
+                                                            "Verificado (SHA-256 OK). Pronto para instalar a atualização e reiniciar.")
+                                                       : TR("Verified (SHA-256 OK). Ready to replace AppImage and restart.",
+                                                            "Verificado (SHA-256 OK). Pronto para substituir o AppImage e reiniciar."));
                                 if (ImGui::Button(TR("Install & Restart", "Instalar e reiniciar"), ImVec2(220 * g_s, 0))) {
                                     if (updater_launch_external_apply_and_exit_ready()) {
                                         updater_shutdown();
@@ -3416,9 +3422,9 @@ extern "C" void launcher_run(const char *root) {
                                     }
                                 }
                                 ImGui::SameLine();
-                            } else if (!ms.linux_asset_url.empty() && !ms.sha256sums_url.empty()) {
+                            } else if (!asset_url.empty() && !ms.sha256sums_url.empty()) {
                                 if (ImGui::Button(TR("Download & Update", "Baixar e atualizar"), ImVec2(200 * g_s, 0)))
-                                    ImGui::OpenPopup("##updconfirm_linux");
+                                    ImGui::OpenPopup("##updconfirm_install");
                                 ImGui::SameLine();
                             }
                         } else if (!ms.install_reason.empty()) {
@@ -3427,19 +3433,30 @@ extern "C" void launcher_run(const char *root) {
                     }
 
                     ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                    if (ImGui::BeginPopupModal("##updconfirm_linux", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+                    if (ImGui::BeginPopupModal("##updconfirm_install", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar)) {
+                        bool is_win_zip = (ms.install_kind == UPD_INSTALL_WINDOWS_ZIP);
+                        uint64_t asset_sz = is_win_zip ? ms.windows_asset_size : ms.linux_asset_size;
                         ImGui::PushFont(g_font_menu);
                         ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s",
-                                           (std::string(TR("Update AppImage to ", "Atualizar AppImage para ")) +
+                                           (std::string(is_win_zip
+                                                            ? TR("Update PokeV-Recomp to ", "Atualizar PokeV-Recomp para ")
+                                                            : TR("Update AppImage to ", "Atualizar AppImage para ")) +
                                             updater_tag_label(ms.latest_tag, false) + "?").c_str());
                         ImGui::PopFont();
-                        if (ms.linux_asset_size > 0)
-                            ImGui::Text(TR("Downloads %.1f MB from GitHub, verifies SHA-256, backs up your current AppImage and restarts.",
-                                           "Baixa %.1f MB do GitHub, verifica o SHA-256, faz backup do AppImage atual e reinicia."),
-                                        ms.linux_asset_size / 1e6);
-                        else
-                            ImGui::Text("%s", TR("Downloads the new AppImage from GitHub, verifies SHA-256, backs up the current one and restarts.",
-                                                 "Baixa o novo AppImage do GitHub, verifica o SHA-256, faz backup do atual e reinicia."));
+                        if (asset_sz > 0) {
+                            ImGui::Text(is_win_zip
+                                            ? TR("Downloads %.1f MB from GitHub, verifies SHA-256, backs up current app files and restarts.",
+                                                 "Baixa %.1f MB do GitHub, verifica o SHA-256, faz backup dos arquivos atuais e reinicia.")
+                                            : TR("Downloads %.1f MB from GitHub, verifies SHA-256, backs up your current AppImage and restarts.",
+                                                 "Baixa %.1f MB do GitHub, verifica o SHA-256, faz backup do AppImage atual e reinicia."),
+                                        asset_sz / 1e6);
+                        } else {
+                            ImGui::Text("%s", is_win_zip
+                                                  ? TR("Downloads the update ZIP from GitHub, verifies SHA-256, backs up current app files and restarts.",
+                                                       "Baixa o ZIP de atualização do GitHub, verifica o SHA-256, faz backup dos arquivos atuais e reinicia.")
+                                                  : TR("Downloads the new AppImage from GitHub, verifies SHA-256, backs up the current one and restarts.",
+                                                       "Baixa o novo AppImage do GitHub, verifica o SHA-256, faz backup do atual e reinicia."));
+                        }
                         ImGui::TextDisabled("%s", TR("Saves, settings, mods and compiled game data are never modified.",
                                                      "Saves, configurações, mods e dados do jogo nunca são alterados."));
                         ImGui::Spacing();

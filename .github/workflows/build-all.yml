@@ -186,6 +186,7 @@ jobs:
               names = set(zf.namelist())
               required = [
                   "PokeV-Recomp/PokeV-Recomp.exe",
+                  "PokeV-Recomp/PokeV-Recomp-updater.exe",
                   "PokeV-Recomp/recomplauncher.json",
                   "PokeV-Recomp/zaimport/zaimport.exe",
                   "PokeV-Recomp/zig/zig.exe",
