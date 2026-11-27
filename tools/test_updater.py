@@ -80,6 +80,7 @@ static UpdaterSnapshot wait_check_done() {
     return updater_get_snapshot();
 }
 
+#if defined(__linux__) || defined(_WIN32)
 static UpdaterSnapshot wait_install_done() {
     for (int i = 0; i < 400; i++) {
         UpdaterSnapshot s = updater_get_snapshot();
@@ -89,6 +90,7 @@ static UpdaterSnapshot wait_install_done() {
     assert(false && "updater_start_install timed out");
     return updater_get_snapshot();
 }
+#endif
 
 static void write_bytes(const std::string &path, const std::string &data) {
     FILE *f = fopen(path.c_str(), "wb");

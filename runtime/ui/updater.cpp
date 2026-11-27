@@ -873,6 +873,22 @@ void updater_configure(const char *current_version, const char *data_root,
             }
         }
     }
+#elif defined(_WIN32)
+    if (recovery_tgt.empty() && !g_snap.suppressed_by_launcher) {
+        if (const char *td = getenv("LARECOMP_TEST_WIN_INSTALL_DIR")) {
+            if (*td) recovery_tgt = td;
+        }
+#ifdef LARECOMP_ZIP_BUILD
+        if (recovery_tgt.empty()) {
+            std::wstring wexe(32768, L'\0');
+            DWORD n = GetModuleFileNameW(nullptr, wexe.data(), (DWORD)wexe.size());
+            if (n > 0 && n < wexe.size()) {
+                wexe.resize(n);
+                recovery_tgt = fs::path(wexe).parent_path().u8string();
+            }
+        }
+#endif
+    }
 #endif
     g_snap.install_error.clear();
     g_snap.updated_from_tag.clear();
