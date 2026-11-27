@@ -1212,6 +1212,11 @@ def test_windows_helper_e2e(cxx: str):
             str(inst), str(ubak), str(ulock), "5000", "1",
         ], timeout=15)
         assert res.returncode == 0
+        for _ in range(40):
+            if (inst / "relaunched.txt").is_file():
+                break
+            time.sleep(0.05)
+        assert (inst / "relaunched.txt").is_file()
         assert not (inst / "new_feature.dll").exists()
         assert not ubak.exists()
         assert not (inst / ".PokeV-Recomp.update-in-progress").exists()
