@@ -8481,7 +8481,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (movie_box_on < 0) { const char *e = ENV("LARECOMP_WIDE_MOVIE_BOX"); movie_box_on = !e || atoi(e) != 0; }
     if (movie_box_on && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor) {
         for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
-            NvnTexture *t = FTEX(i);
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
             const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
             if (b && b->is_movie && b->movie_w > 0 && b->movie_h > 0) {
                 vp_box_aspect((float)b->movie_w / (float)b->movie_h);
