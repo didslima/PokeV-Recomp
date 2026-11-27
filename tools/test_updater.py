@@ -417,18 +417,24 @@ int main() {
         assert(blocks[5].spans[0].text == "./PokeV-Recomp.AppImage");
 
         // Verify prerelease channel flag in snapshot (cross-platform)
+        set_env("LARECOMP_NO_UPDATE_CHECK", nullptr);
+        set_env("LARECOMP_UPDATE_HTTP_STATUS", "200");
+        set_env("LARECOMP_UPDATE_JSON",
+                R"([{"tag_name":"v0.1.1-rc.1","draft":false,"prerelease":true,"html_url":"https://github.com/x/rc1","body":"RC 1"}])");
         set_env("LARECOMP_UPDATE_PRERELEASE", "1");
-        set_env("LARECOMP_UPDATE_TAG", "v0.1.1-rc.1");
-        updater_configure("v0.1.0", NULL, false, false);
+        updater_configure("v0.1.0", nullptr, false, false);
         updater_start_check(true);
         UpdaterSnapshot ps = wait_check_done();
         assert(ps.is_prerelease_channel == true);
-        set_env("LARECOMP_UPDATE_PRERELEASE", NULL);
-        set_env("LARECOMP_UPDATE_TAG", "v0.2.0");
-        updater_configure("v0.1.0", NULL, false, false);
+        set_env("LARECOMP_UPDATE_PRERELEASE", nullptr);
+        set_env("LARECOMP_UPDATE_JSON",
+                R"({"tag_name":"v0.2.0","draft":false,"prerelease":false,"html_url":"https://github.com/x/v020","body":"Stable"})");
+        updater_configure("v0.1.0", nullptr, false, false);
         updater_start_check(true);
         ps = wait_check_done();
         assert(ps.is_prerelease_channel == false);
+        set_env("LARECOMP_UPDATE_JSON", nullptr);
+        set_env("LARECOMP_UPDATE_HTTP_STATUS", nullptr);
         printf("ok   markdown parser & prerelease channel flag\n");
     }
 
