@@ -269,11 +269,19 @@ struct HuffTable {
 
 }  // namespace
 
+static constexpr uint64_t k_max_entry_uncomp = 1024ULL * 1024ULL * 1024ULL;       // 1 GiB per entry
+static constexpr uint64_t k_max_total_uncomp = 2ULL * 1024ULL * 1024ULL * 1024ULL; // 2 GiB aggregate
+static constexpr uint64_t k_max_cd_entries = 100000ULL;
+
+static bool bounds_ok(uint64_t off, uint64_t len, uint64_t total) {
+    return off <= total && len <= total - off;
+}
+
 static bool inflate_deflate(const uint8_t *comp, size_t comp_len,
                             uint64_t expected_out_len,
                             std::vector<uint8_t> &out) {
     out.clear();
-    if (expected_out_len > 1024ULL * 1024ULL * 1024ULL) return false;  // sanity cap 1 GB per entry
+    if (expected_out_len > k_max_entry_uncomp) return false;
     out.reserve((size_t)expected_out_len);
 
     BitStream bs;
@@ -466,13 +474,39 @@ static bool write_file_win(const std::string &path_u8, const uint8_t *data, size
 }
 #endif
 
+static fs::path make_fs_path(const std::string &u8) {
+#ifdef _WIN32
+    return fs::path(utf8_to_wide_long(u8));
+#else
+    return fs::path(u8);
+#endif
+}
+
+static FILE *open_zip_file_rb(const std::string &u8) {
+#ifdef _WIN32
+    return _wfopen(utf8_to_wide_long(u8).c_str(), L"rb");
+#else
+    return fopen(u8.c_str(), "rb");
+#endif
+}
+
+static bool seek_zip_u64(FILE *f, uint64_t off) {
+#ifdef _WIN32
+    if (off > (uint64_t)_I64_MAX) return false;
+    return _fseeki64(f, (__int64)off, SEEK_SET) == 0;
+#else
+    if (off > (uint64_t)INT64_MAX) return false;
+    return fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+}
+
 WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
                                              const std::string &dest_dir,
                                              const std::string &strip_top_prefix) {
     WinZipExtractResult res;
     std::error_code ec;
 
-    fs::path dest_p(dest_dir);
+    fs::path dest_p = make_fs_path(dest_dir);
     if (fs::is_symlink(dest_p, ec)) {
         res.error = "Destination staging directory cannot be a symbolic link.";
         return res;
@@ -488,29 +522,38 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
         return res;
     }
 
-    FILE *f = fopen(zip_path.c_str(), "rb");
+    FILE *f = open_zip_file_rb(zip_path);
     if (!f) {
         res.error = "Unable to open ZIP archive.";
         return res;
     }
-    if (fseek(f, 0, SEEK_END) != 0) {
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) != 0) {
         fclose(f);
         res.error = "Unable to seek ZIP archive.";
         return res;
     }
-    long fsz_l = ftell(f);
-    if (fsz_l < 22) {
+    __int64 fsz_i64 = _ftelli64(f);
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        res.error = "Unable to seek ZIP archive.";
+        return res;
+    }
+    off_t fsz_i64 = ftello(f);
+#endif
+    if (fsz_i64 < 22) {
         fclose(f);
         res.error = "ZIP archive is truncated or invalid.";
         return res;
     }
-    size_t file_size = (size_t)fsz_l;
+    uint64_t file_size = (uint64_t)fsz_i64;
     rewind(f);
 
     // Find EOCD (End of Central Directory) within last 65557 bytes
-    size_t tail_len = std::min<size_t>(file_size, 65557);
+    size_t tail_len = (size_t)std::min<uint64_t>(file_size, 65557);
     std::vector<uint8_t> tail(tail_len);
-    if (fseek(f, (long)(file_size - tail_len), SEEK_SET) != 0 ||
+    if (!seek_zip_u64(f, file_size - tail_len) ||
         fread(tail.data(), 1, tail_len, f) != tail_len) {
         fclose(f);
         res.error = "Failed to read ZIP End of Central Directory.";
@@ -548,25 +591,32 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
     // Check ZIP64 EOCD locator (20 bytes immediately before EOCD)
     if (eocd_off >= 20 && rd32(tail.data() + eocd_off - 20) == 0x07064b50u) {
         uint64_t z64_off = rd64(tail.data() + eocd_off - 12);
-        if (z64_off + 56 <= file_size) {
-            uint8_t z64[56];
-            if (fseek(f, (long)z64_off, SEEK_SET) == 0 && fread(z64, 1, 56, f) == 56 &&
-                rd32(z64) == 0x06064b50u) {
-                entry_count = rd64(z64 + 32);
-                cd_size = rd64(z64 + 40);
-                cd_offset = rd64(z64 + 48);
-            }
+        if (!bounds_ok(z64_off, 56, file_size)) {
+            fclose(f);
+            res.error = "ZIP64 End of Central Directory offset is out of bounds.";
+            return res;
         }
+        uint8_t z64[56];
+        if (!seek_zip_u64(f, z64_off) || fread(z64, 1, 56, f) != 56 ||
+            rd32(z64) != 0x06064b50u) {
+            fclose(f);
+            res.error = "Corrupt ZIP64 End of Central Directory.";
+            return res;
+        }
+        entry_count = rd64(z64 + 32);
+        cd_size = rd64(z64 + 40);
+        cd_offset = rd64(z64 + 48);
     }
 
-    if (cd_offset + cd_size > file_size || cd_size > 64ULL * 1024ULL * 1024ULL) {
+    if (entry_count > k_max_cd_entries || !bounds_ok(cd_offset, cd_size, file_size) ||
+        cd_size > 64ULL * 1024ULL * 1024ULL) {
         fclose(f);
         res.error = "ZIP Central Directory bounds are invalid.";
         return res;
     }
 
     std::vector<uint8_t> cd((size_t)cd_size);
-    if (fseek(f, (long)cd_offset, SEEK_SET) != 0 ||
+    if (!seek_zip_u64(f, cd_offset) ||
         fread(cd.data(), 1, (size_t)cd_size, f) != (size_t)cd_size) {
         fclose(f);
         res.error = "Failed to read ZIP Central Directory.";
@@ -576,6 +626,7 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
     std::unordered_set<std::string> seen_lower;
     size_t cpos = 0;
     uint64_t parsed_entries = 0;
+    uint64_t total_uncomp_bytes = 0;
     std::vector<uint8_t> comp_buf, uncomp_buf;
 
     auto abort_cleanup = [&](const std::string &err) {
@@ -672,10 +723,10 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
             return abort_cleanup("Duplicate ZIP entry (case-insensitive collision): " + rel_path);
         }
 
-        fs::path out_p = canonical_dest / fs::path(rel_path);
+        fs::path out_p = canonical_dest / fs::u8path(rel_path);
         fs::path norm_out = out_p.lexically_normal();
-        auto dest_str = canonical_dest.generic_string();
-        auto out_str = norm_out.generic_string();
+        auto dest_str = canonical_dest.generic_u8string();
+        auto out_str = norm_out.generic_u8string();
         if (out_str.size() <= dest_str.size() ||
             out_str.rfind(dest_str, 0) != 0 ||
             out_str[dest_str.size()] != '/') {
@@ -684,7 +735,7 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
 
         if (is_dir) {
 #ifdef _WIN32
-            if (!mkdirs_win(norm_out.string())) {
+            if (!mkdirs_win(norm_out.u8string())) {
 #else
             fs::create_directories(norm_out, ec);
             if (ec) {
@@ -694,21 +745,30 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
             continue;
         }
 
-        // Read Local File Header
-        if (lfh_offset + 30 > file_size) {
+        // Read Local File Header with overflow-safe bounds checks
+        if (!bounds_ok(lfh_offset, 30, file_size)) {
             return abort_cleanup("Invalid Local File Header offset for: " + rel_path);
         }
         uint8_t lfh[30];
-        if (fseek(f, (long)lfh_offset, SEEK_SET) != 0 || fread(lfh, 1, 30, f) != 30 ||
+        if (!seek_zip_u64(f, lfh_offset) || fread(lfh, 1, 30, f) != 30 ||
             rd32(lfh) != 0x04034b50u) {
             return abort_cleanup("Corrupt Local File Header for: " + rel_path);
         }
         uint16_t lfh_nlen = rd16(lfh + 26);
         uint16_t lfh_elen = rd16(lfh + 28);
-        uint64_t data_off = lfh_offset + 30 + lfh_nlen + lfh_elen;
-        if (data_off + comp_size > file_size || comp_size > 1024ULL * 1024ULL * 1024ULL) {
+        uint64_t hdr_total = 30ULL + (uint64_t)lfh_nlen + (uint64_t)lfh_elen;
+        if (!bounds_ok(lfh_offset, hdr_total, file_size)) {
+            return abort_cleanup("ZIP Local File Header exceeds archive bounds: " + rel_path);
+        }
+        uint64_t data_off = lfh_offset + hdr_total;
+        if (!bounds_ok(data_off, comp_size, file_size) || comp_size > k_max_entry_uncomp) {
             return abort_cleanup("ZIP entry payload exceeds archive bounds: " + rel_path);
         }
+        if (uncomp_size > k_max_entry_uncomp ||
+            uncomp_size > k_max_total_uncomp - total_uncomp_bytes) {
+            return abort_cleanup("ZIP uncompressed size exceeds safety limit: " + rel_path);
+        }
+        total_uncomp_bytes += uncomp_size;
 
         if (method != 0 && method != 8) {
             return abort_cleanup("Unsupported ZIP compression method for: " + rel_path);
@@ -716,7 +776,7 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
 
         comp_buf.resize((size_t)comp_size);
         if (comp_size > 0) {
-            if (fseek(f, (long)data_off, SEEK_SET) != 0 ||
+            if (!seek_zip_u64(f, data_off) ||
                 fread(comp_buf.data(), 1, (size_t)comp_size, f) != (size_t)comp_size) {
                 return abort_cleanup("Failed to read compressed payload for: " + rel_path);
             }
@@ -746,10 +806,10 @@ WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
             return abort_cleanup("Staging parent path is a symbolic link: " + rel_path);
         }
 #ifdef _WIN32
-        if (!mkdirs_win(parent.string())) {
+        if (!mkdirs_win(parent.u8string())) {
             return abort_cleanup("Failed to create parent directory for: " + rel_path);
         }
-        if (!write_file_win(norm_out.string(), payload, payload_len)) {
+        if (!write_file_win(norm_out.u8string(), payload, payload_len)) {
             return abort_cleanup("Failed to write extracted file: " + rel_path);
         }
 #else

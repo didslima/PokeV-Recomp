@@ -28,7 +28,8 @@ bool updater_validate_zip_entry_path(const std::string &raw_name,
 
 // Safely validate and extract a ZIP archive into `dest_dir`.
 // Supports Stored (0) and Deflate (8), ZIP32/ZIP64 EOCD, CRC-32 verification,
-// symlink/reparse-point rejection, and case-insensitive duplicate detection.
+// symlink/reparse-point rejection, case-insensitive duplicate detection,
+// overflow-safe bounds checks, and decompression limits (1 GiB/entry, 2 GiB aggregate).
 WinZipExtractResult updater_extract_zip_safe(const std::string &zip_path,
                                              const std::string &dest_dir,
                                              const std::string &strip_top_prefix);
