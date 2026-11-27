@@ -620,6 +620,11 @@ UpdaterInstallKind updater_detect_install_kind(std::string &out_target_path, std
     }
 
     // Verify official Windows ZIP layout markers before allowing any automated replacement
+    if (fs::exists(dir_p / ".PokeV-Recomp.update-in-progress", ec) ||
+        fs::exists(dir_p / ".PokeV-Recomp.update.bak", ec)) {
+        out_reason = "Previous update recovery is incomplete; close all instances and restart, or restore .PokeV-Recomp.update.bak.";
+        return UPD_INSTALL_UNSUPPORTED;
+    }
     static const char *const k_markers[] = {
         "PokeV-Recomp.exe",
         "PokeV-Recomp-updater.exe",
@@ -776,25 +781,49 @@ static void cleanup_on_boot_locked(const std::string &data_root, const std::stri
         fs::path exe_p = dir / "PokeV-Recomp.exe";
 
         // Interrupted replacement (reboot/crash): restore from backup directory if needed
+        bool recovery_incomplete = false;
         if (fs::is_directory(bak_dir, ec)) {
             if (fs::exists(prog_marker, ec) || !fs::exists(exe_p, ec)) {
+                std::vector<fs::path> bak_files;
                 for (const auto &ent : fs::recursive_directory_iterator(bak_dir, ec)) {
-                    if (!ent.is_regular_file(ec)) continue;
-                    fs::path rel = fs::relative(ent.path(), bak_dir, ec);
-                    if (ec || rel.empty()) continue;
+                    if (ent.is_regular_file(ec)) bak_files.push_back(ent.path());
+                }
+                bool all_restored = !ec;
+                for (const auto &src_p : bak_files) {
+                    fs::path rel = fs::relative(src_p, bak_dir, ec);
+                    if (ec || rel.empty()) {
+                        all_restored = false;
+                        continue;
+                    }
                     fs::path dst = dir / rel;
                     fs::create_directories(dst.parent_path(), ec);
-                    MoveFileExW(ent.path().wstring().c_str(), dst.wstring().c_str(),
-                                MOVEFILE_REPLACE_EXISTING);
+                    if (ec) {
+                        all_restored = false;
+                        continue;
+                    }
+                    if (!MoveFileExW(src_p.wstring().c_str(), dst.wstring().c_str(),
+                                     MOVEFILE_REPLACE_EXISTING)) {
+                        all_restored = false;
+                    }
                 }
-                fs::remove(prog_marker, ec);
+                if (all_restored) {
+                    fs::remove(prog_marker, ec);
+                    fs::remove_all(bak_dir, ec);
+                } else {
+                    recovery_incomplete = true;
+                    g_snap.install_state = UPD_INST_FAILED;
+                    g_snap.install_error =
+                        "Update recovery incomplete: some files in .PokeV-Recomp.update.bak could not be restored "
+                        "(files may still be in use). Close all instances and restart, or restore manually from .PokeV-Recomp.update.bak.";
+                }
+            } else {
+                fs::remove_all(bak_dir, ec);
             }
-            fs::remove_all(bak_dir, ec);
         } else {
             fs::remove(prog_marker, ec);
         }
 
-        if (fs::is_regular_file(err_marker, ec)) {
+        if (!recovery_incomplete && fs::is_regular_file(err_marker, ec)) {
             std::string prev_err = read_file_capped(err_marker.u8string(), 1024);
             while (!prev_err.empty() && (prev_err.back() == '\n' || prev_err.back() == '\r')) prev_err.pop_back();
             if (!prev_err.empty()) g_snap.install_error = prev_err;
@@ -890,16 +919,16 @@ void updater_configure(const char *current_version, const char *data_root,
 #endif
     }
 #endif
+    g_snap.install_state = UPD_INST_IDLE;
     g_snap.install_error.clear();
     g_snap.updated_from_tag.clear();
     cleanup_on_boot_locked(g_data_root, recovery_tgt);
     if (tgt.empty() && !recovery_tgt.empty()) {
-        // Re-detect in case boot recovery restored the AppImage from .bak
+        // Re-detect in case boot recovery restored the AppImage/EXE from .bak
         g_snap.install_kind = updater_detect_install_kind(tgt, reason);
     }
     g_snap.install_target_path = tgt;
     g_snap.install_reason = reason;
-    g_snap.install_state = UPD_INST_IDLE;
     g_snap.downloaded_bytes = 0;
     g_snap.total_bytes = 0;
     g_staged_path.clear();
@@ -1760,16 +1789,44 @@ bool updater_launch_external_apply_and_exit_ready() {
                        quote_arg(to_w(note_path)) + L" " +
                        quote_arg(to_w(tag)) + L" 15000 1";
 
+    SIZE_T attr_size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+    if (attr_size == 0) {
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        set_install_failed("Failed to size Windows process attribute list.");
+        return false;
+    }
+    std::vector<uint8_t> attr_buf(attr_size);
+    LPPROC_THREAD_ATTRIBUTE_LIST attr_list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+    if (!InitializeProcThreadAttributeList(attr_list, 1, 0, &attr_size)) {
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        set_install_failed("Failed to initialize Windows process attribute list.");
+        return false;
+    }
+    if (!UpdateProcThreadAttribute(attr_list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   &hParentInherit, sizeof(HANDLE), nullptr, nullptr)) {
+        DeleteProcThreadAttributeList(attr_list);
+        CloseHandle(hParentInherit);
+        fs::remove(tmp_helper, ec);
+        set_install_failed("Failed to bind inherited handle list for Windows update helper.");
+        return false;
+    }
+
     pthread_mutex_lock(&g_upd_lock);
     g_snap.install_state = UPD_INST_APPLYING;
     pthread_mutex_unlock(&g_upd_lock);
 
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
+    STARTUPINFOEXW siex{};
+    siex.StartupInfo.cb = sizeof(siex);
+    siex.lpAttributeList = attr_list;
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessW(tmp_helper.wstring().c_str(), cmd.data(), nullptr, nullptr, TRUE,
-                             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-                             nullptr, dir.wstring().c_str(), &si, &pi);
+                             DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW |
+                                 EXTENDED_STARTUPINFO_PRESENT,
+                             nullptr, dir.wstring().c_str(), &siex.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(attr_list);
     CloseHandle(hParentInherit);
     if (!ok) {
         fs::remove(tmp_helper, ec);
