@@ -173,7 +173,14 @@ int main(void) {
 '''
 
 
+def split_cmd(cmd, posix_mode=None):
+    if posix_mode is None:
+        posix_mode = os.name != "nt"
+    return shlex.split(cmd, posix=posix_mode)
+
+
 def main():
+    assert split_cmd(r"C:\msys64\ucrt64\bin\clang.EXE", posix_mode=False) == [r"C:\msys64\ucrt64\bin\clang.EXE"]
     cc = os.environ.get("CC") or shutil.which("clang") or shutil.which("gcc")
     assert cc, "No C compiler found"
     with tempfile.TemporaryDirectory() as tmp:
@@ -181,7 +188,7 @@ def main():
         src = t / "test_kernel_spin.c"
         exe = t / ("test_kernel_spin.exe" if os.name == "nt" else "test_kernel_spin")
         src.write_text(TEST_C, encoding="utf-8")
-        cmd = shlex.split(cc) + ["-O2", "-Wall", "-Wextra", "-Werror", str(src), "-pthread", "-o", str(exe)]
+        cmd = split_cmd(cc) + ["-O2", "-Wall", "-Wextra", "-Werror", str(src), "-pthread", "-o", str(exe)]
         subprocess.run(cmd, cwd=ROOT, check=True)
         for kspin in ["0", "2000"]:
             for wsp in ["0", "30"]:

@@ -1103,4 +1103,44 @@ Mudanças entre a `v0.0.30` e a `v0.1.0`:
 
 ---
 
+## 39. Release v0.1.1 — Update Checker, Linux AppImage Auto-Updater e polimento de UX
+
+Mudanças entre a `v0.1.0` e a `v0.1.1`:
+- **Update Checker & Modal de Release Notes (Phase A):** verificação automática de GitHub Releases na inicialização (`runtime/ui/updater.cpp`, `runtime/ui/launcher.mm`), respeitando `LARECOMP_NO_UPDATE_CHECK=1` e canal pré-release (`LARECOMP_UPDATE_PRERELEASE=1`).
+- **Linux AppImage Auto-Updater (Phase B):** atualização in-app em 1 clique no Linux com verificação SHA-256 contra `SHA256SUMS`, backup atômico, helper `/bin/sh` destacado, recuperação no boot e relançamento automático.
+- **Polimento de UX:** renderização amigável de Markdown no modal de release notes, layout responsivo (`880x580` máx.) e indicador visual de atualização disponível.
+- **`GAMELIB_ID` inalterado:** sem necessidade de recompilar o código do jogo ao atualizar da `v0.1.0`.
+  Versão **`v0.1.1`**.
+
+---
+
+## 40. Release v0.2.0-rc.1 — Windows Auto-Updater (#63), correções de 60 FPS (#58–#61, #65), DLAA (#66) e cutscenes ultrawide (#67)
+
+Mudanças entre a `v0.1.1` e a `v0.2.0-rc.1`:
+
+### Novas Funcionalidades (Features)
+- **#63 (Updater, didslima):** **Windows ZIP Auto-Updater (Phase C)** — extrator ZIP32/ZIP64 próprio (`runtime/ui/win_zip.cpp`) com proteção contra decompression bombs/Zip Slip e helper externo (`tools/win_updater_helper.cpp`, `PokeV-Recomp-updater.exe`) com staging, backup `.PokeV-Recomp.update.bak`, recuperação fora do processo (`--recover`) e rollback completo preservando `save/`, `mods/`, `larecomp.ini` e `extracted/`. Testes: `tools/test_updater.py`.
+- **#67 (Ultrawide, didslima):** preservação do aspect ratio nativo de cutscenes pré-renderizadas em monitores ultrawide (`runtime/nvn/vulkan/vk.h`, `textures.c`, `exec.c`, `runtime/hle/movie.c`), com pillarboxes/letterboxes pretos opacos, suporte ao fallback CPU `out_mem` e kill switch `LARECOMP_WIDE_MOVIE_BOX=0`. Testes: `tools/test_movie_box.py`.
+
+### Correções de Bugs (Bug Fixes)
+- **#57 (Vulkan, Atterax):** depth clamp habilitado também em passes de cor com profundidade (`exec.c`), corrigindo o chão preto sob a Poké Ball em *Scarlet & Violet* (`LARECOMP_VK_NO_DEPTH_CLAMP=0` corrigido na revisão).
+- **#59 & #65 (60 FPS Timeline, Atterax):** tratamento de clipes de timeline de 1 frame a 60 FPS com paridade par/ímpar (`tools/sv_patches.py` `_sv_timeline_time`, `runtime/hle/framepace.c` `rt_sv_timeline_time`), corrigindo perda de chão/grama na captura selvagem e câmera da captura em Tera Raid (`LARECOMP_SV_TIMELINE_SNAP=0` desliga). Testes: `tools/test_sv_timeline.py`.
+- **#60 (Vulkan/DLAA, Atterax):** desativa cópias de storage snapshots para draws cujos shaders escrevem na memória global (`exec.c`), corrigindo rostos travados em pose neutra (regressão da PR #46) com guarda `si == NULL` em `snap_draw_mask()`.
+- **#61 (60 FPS Câmera Interna, Atterax):** passos da câmera interna a 60 FPS com escala equivalente `(1 - f)^2 == 1 - f30` (`tools/sv_patches.py` `_sv_lua_clock_slot`, `runtime/hle/framepace.c` `rt_sv_lua_clock_slot`), corrigindo tremor do personagem em interiores (`LARECOMP_SV_LUA_CAMERA=0` desliga). Testes: `tools/test_sv_indoor_camera.py`.
+- **#66 (DLAA, Atterax & didslima):** object motion vectors rastreados por draw `(mesh, program, draw_index)` em vez de por mesh (`exec.c` `objmv_capture`), corrigindo linhas pretas em chefes de Tera Raid + adiamento de `e->frame[cur] = f` para evitar exposição de buffers parciais em falha de `realloc()`. Testes: `tools/test_objmv_cbuf.py`.
+
+### Performance
+- **#58 (Kernel, Atterax):** spin curto antes de dormir em `klock()` e `block_current()` (`runtime/kernel.c`, `LARECOMP_KLOCK_SPIN` / `LARECOMP_KWAIT_SPIN_US`), reduzindo a pausa no arremesso da Poké Ball, com correções atômicas em `wait_kind` e inicialização via `pthread_once`. Testes: `tools/test_kernel_spin.py`.
+
+### Documentação & Problemas Conhecidos
+- Documentada nos `README.md` e `README.pt-BR.md` a distorção preexistente na foto de perfil do personagem na tela do Formulário de Matrícula da Academia Uva (em aberto; sem relação com a PR #67).
+
+### Impacto de Recompilação
+- **`GAMELIB_ID` muda (#59 e #61 alteram `tools/sv_patches.py`):** ao atualizar da `v0.1.1`, o launcher executará uma **recompilação incremental única** do código do jogo na tela inicial.
+- **`SHADER_TRANSLATOR_ID` inalterado:** o cache de shaders existente permanece compatível.
+- **Saves, configurações (`larecomp.ini`) e `mods/`:** 100% compatíveis e preservados.
+  Versão **`v0.2.0-rc.1`**.
+
+---
+
 *Documento mantido em sincronia contínua pelo assistente de IA Antigravity (Google DeepMind).*

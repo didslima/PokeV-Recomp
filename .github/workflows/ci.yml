@@ -277,6 +277,9 @@ jobs:
             tools/test_flagfuse.py
             tools/test_gamebuild_resume.py
             tools/test_game_identity.py
+            tools/test_kernel_spin.py
+            tools/test_movie_box.py
+            tools/test_objmv_cbuf.py
             tools/test_pace.py
             tools/test_recomplauncher.py
             tools/test_regpromote.py
@@ -291,6 +294,8 @@ jobs:
             tests+=(
               tools/test_data_dir.py
               tools/test_issue22_fix.py
+              tools/test_sv_indoor_camera.py
+              tools/test_sv_timeline.py
             )
           fi
           if [ "${{ matrix.platform }}" != "macos" ]; then
