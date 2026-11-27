@@ -221,6 +221,69 @@ static bool wait_for_parent_exit(DWORD pid, uintptr_t handle_val, DWORD timeout_
     return true;
 }
 
+static bool is_reserved_dos_name_w(const std::wstring &seg) {
+    size_t dot = seg.find(L'.');
+    std::wstring base = to_lower_w(dot == std::wstring::npos ? seg : seg.substr(0, dot));
+    if (base == L"con" || base == L"prn" || base == L"aux" || base == L"nul") return true;
+    if (base.size() == 4 && (base.rfind(L"com", 0) == 0 || base.rfind(L"lpt", 0) == 0) &&
+        base[3] >= L'1' && base[3] <= L'9') {
+        return true;
+    }
+    return false;
+}
+
+static bool is_protected_user_rel_w(const std::wstring &rel_low) {
+    if (rel_low == L"larecomp.ini" || rel_low == L"data_root.txt" ||
+        rel_low == L"gamecontrollerdb.txt" || rel_low == L"lasrecomp.log") {
+        return true;
+    }
+    if (rel_low.rfind(L".pokev-recomp.", 0) == 0 || rel_low.rfind(L".update-staging", 0) == 0) {
+        return true;
+    }
+    static const wchar_t *const k_dirs[] = {
+        L"recompdata\\", L"save\\", L"extracted\\", L"mods\\", L"rando\\", L"cache\\",
+        L"screenshots\\", L"fonts\\",
+    };
+    for (const wchar_t *d : k_dirs) {
+        size_t n = wcslen(d);
+        if (rel_low.rfind(d, 0) == 0 || rel_low == std::wstring(d, n - 1)) return true;
+    }
+    return false;
+}
+
+static bool is_safe_manifest_rel_path(const std::wstring &raw_rel) {
+    if (raw_rel.empty()) return false;
+    std::wstring norm = raw_rel;
+    std::replace(norm.begin(), norm.end(), L'/', L'\\');
+    if (norm[0] == L'\\') return false;
+    if (norm.size() >= 2 && iswalpha(norm[0]) && norm[1] == L':') return false;
+    for (wchar_t c : norm) {
+        if (c < 0x20 || c == L':' || c == L'*' || c == L'?' || c == L'"' ||
+            c == L'<' || c == L'>' || c == L'|') {
+            return false;
+        }
+    }
+    size_t pos = 0;
+    while (pos < norm.size()) {
+        size_t sl = norm.find(L'\\', pos);
+        if (sl == std::wstring::npos) sl = norm.size();
+        std::wstring seg = norm.substr(pos, sl - pos);
+        pos = sl + 1;
+        if (seg.empty() || seg == L"." || seg == L"..") return false;
+        if (seg.back() == L' ' || seg.back() == L'.') return false;
+        if (is_reserved_dos_name_w(seg)) return false;
+    }
+    if (is_protected_user_rel_w(to_lower_w(norm))) return false;
+    return true;
+}
+
+static bool validate_manifest_list(const std::vector<std::wstring> &list) {
+    for (const auto &rel : list) {
+        if (!is_safe_manifest_rel_path(rel)) return false;
+    }
+    return true;
+}
+
 static bool collect_relative_files(const std::wstring &base_dir, const std::wstring &sub_rel,
                                    std::vector<std::wstring> &out) {
     std::wstring cur = sub_rel.empty() ? base_dir : join_path(base_dir, sub_rel);
@@ -290,7 +353,9 @@ static int run_recover_mode(int argc, wchar_t **argv) {
     std::wstring err_marker = join_path(install_dir, L".PokeV-Recomp.update-error.txt");
     std::wstring progress_marker = join_path(install_dir, L".PokeV-Recomp.update-in-progress");
     std::wstring notice_marker = join_path(install_dir, L".PokeV-Recomp.update-notice.txt");
+    std::wstring app_manifest_path = join_path(install_dir, L".PokeV-Recomp.app-manifest");
     std::wstring staging_root = join_path(install_dir, L".update-staging");
+    std::wstring staged_manifest_path = join_path(staging_root, L"manifest.txt");
 
     auto fail_keep_backup = [&](const std::string &msg, int code) {
         write_text_file(err_marker, msg);
@@ -317,7 +382,39 @@ static int run_recover_mode(int argc, wchar_t **argv) {
             "Recovery failed: .PokeV-Recomp.update.bak is empty. Please reinstall PokeV-Recomp.", 11);
     }
 
-    // 3. Confirm target executables/DLLs are no longer locked (retry up to 5 seconds)
+    // 2b. Load & strictly validate manifests to identify new-only files from interrupted update
+    std::vector<std::wstring> staged_manifest;
+    if (file_exists_nonempty(staged_manifest_path, false)) {
+        staged_manifest = read_manifest_lines(staged_manifest_path);
+        if (staged_manifest.empty() || !validate_manifest_list(staged_manifest)) {
+            return fail_keep_backup(
+                "Recovery aborted: staged manifest is invalid or contains unsafe paths. "
+                "Backup preserved in .PokeV-Recomp.update.bak.",
+                12);
+        }
+    }
+    std::vector<std::wstring> old_manifest;
+    if (file_exists_nonempty(app_manifest_path, false)) {
+        old_manifest = read_manifest_lines(app_manifest_path);
+        if (!validate_manifest_list(old_manifest)) {
+            old_manifest.clear();
+        }
+    }
+
+    std::unordered_set<std::wstring> prev_set;
+    for (const auto &r : bak_files) prev_set.insert(to_lower_w(r));
+    for (const auto &r : old_manifest) prev_set.insert(to_lower_w(r));
+
+    std::vector<std::wstring> new_only_files;
+    std::unordered_set<std::wstring> seen_new;
+    for (const auto &r : staged_manifest) {
+        std::wstring low = to_lower_w(r);
+        if (prev_set.find(low) == prev_set.end() && seen_new.insert(low).second) {
+            new_only_files.push_back(r);
+        }
+    }
+
+    // 3. Confirm all target files (restored + new-only to delete) are unlocked (retry up to 5s)
     DWORD lock_wait_ms = 0;
     bool all_unlocked = false;
     while (lock_wait_ms <= 5000) {
@@ -326,6 +423,14 @@ static int run_recover_mode(int argc, wchar_t **argv) {
             if (!check_file_unlocked(join_path(install_dir, rel))) {
                 all_unlocked = false;
                 break;
+            }
+        }
+        if (all_unlocked) {
+            for (const auto &rel : new_only_files) {
+                if (!check_file_unlocked(join_path(install_dir, rel))) {
+                    all_unlocked = false;
+                    break;
+                }
             }
         }
         if (all_unlocked) break;
@@ -337,7 +442,30 @@ static int run_recover_mode(int argc, wchar_t **argv) {
             "Recovery blocked: target files are still locked by another process. Close all instances and retry.", 3);
     }
 
-    // 4. Restore every file from backup_dir -> install_dir (keep remaining backup files if any step fails)
+    // 4a. Remove new-only files installed by the interrupted update (before moving backup)
+    for (const auto &rel : new_only_files) {
+        std::wstring dst = join_path(install_dir, rel);
+        std::wstring ldst = to_long_win_path(dst);
+        DWORD attr = GetFileAttributesW(ldst.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) continue;
+        if ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0 || (attr & FILE_ATTRIBUTE_REPARSE_POINT) != 0) continue;
+        SetFileAttributesW(ldst.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!DeleteFileW(ldst.c_str())) {
+            return fail_keep_backup(
+                "Recovery failed while removing new update file " + wide_to_utf8(rel) +
+                    ". Backup preserved in .PokeV-Recomp.update.bak.",
+                6);
+        }
+        // Clean up empty parent directories created by the aborted update (RemoveDirectoryW fails if non-empty)
+        std::wstring par = parent_dir(rel);
+        while (!par.empty()) {
+            std::wstring lpar = to_long_win_path(join_path(install_dir, par));
+            if (!RemoveDirectoryW(lpar.c_str())) break;
+            par = parent_dir(par);
+        }
+    }
+
+    // 4b. Restore every file from backup_dir -> install_dir (keep remaining backup files if any step fails)
     for (const auto &rel : bak_files) {
         if (!move_file_mkdir(join_path(backup_dir, rel), join_path(install_dir, rel))) {
             return fail_keep_backup(
@@ -347,13 +475,21 @@ static int run_recover_mode(int argc, wchar_t **argv) {
         }
     }
 
-    // 5. Validate critical files before clearing markers or relaunching
+    // 5. Validate critical files AND full previous manifest (when present) before clearing markers
     std::string missing_crit;
     if (!validate_critical_install_files(install_dir, missing_crit)) {
         return fail_keep_backup(
             "Recovery validation failed (missing " + missing_crit +
                 "). Manual recovery or reinstallation is required.",
             7);
+    }
+    for (const auto &rel : old_manifest) {
+        if (!file_exists_nonempty(join_path(install_dir, rel), false)) {
+            return fail_keep_backup(
+                "Recovery validation failed (missing previous file " + wide_to_utf8(rel) +
+                    "). Manual recovery or reinstallation is required.",
+                7);
+        }
     }
 
     // 6. Commit recovery: clear markers BEFORE relaunching to prevent any relaunch loop
@@ -407,10 +543,13 @@ int wmain(int argc, wchar_t **argv) {
 
     // 2. Load new manifest + optional old manifest
     std::vector<std::wstring> new_manifest = read_manifest_lines(manifest_path);
-    if (new_manifest.empty()) {
-        return fail_clean_only("Staged update manifest is missing or empty.", 2);
+    if (new_manifest.empty() || !validate_manifest_list(new_manifest)) {
+        return fail_clean_only("Staged update manifest is missing, empty, or contains unsafe paths.", 2);
     }
     std::vector<std::wstring> old_manifest = read_manifest_lines(app_manifest_path);
+    if (!validate_manifest_list(old_manifest)) {
+        old_manifest.clear();
+    }
 
     std::vector<std::wstring> backup_targets;
     std::unordered_set<std::wstring> seen;
@@ -463,8 +602,10 @@ int wmain(int argc, wchar_t **argv) {
                 all_restored = false;
             }
         }
-        DeleteFileW(to_long_win_path(progress_marker).c_str());
-        if (all_restored) remove_tree_recursive(backup_dir);
+        if (all_restored) {
+            DeleteFileW(to_long_win_path(progress_marker).c_str());
+            remove_tree_recursive(backup_dir);
+        }
         DeleteFileW(to_long_win_path(lock_path).c_str());
     };
 
