@@ -389,6 +389,49 @@ int main() {
     printf("ok   download cancel & shutdown safety\n");
 #endif
 
+    // 12. Markdown parser & prerelease channel flag (UX polish)
+    {
+        std::string md =
+            "# Release v0.1.1\n\n"
+            "## What's New\n"
+            "- Added **auto-update** with `SHA-256` verification\n"
+            "- See [GitHub](https://github.com/didslima/PokeV-Recomp)\n\n"
+            "> Saves and mods remain untouched.\n\n"
+            "```\n./PokeV-Recomp.AppImage\n```\n";
+        auto blocks = updater_parse_markdown(md);
+        assert(blocks.size() == 6);
+        assert(blocks[0].kind == UPD_MD_HEADING1);
+        assert(blocks[0].spans.size() == 1 && blocks[0].spans[0].text == "Release v0.1.1");
+        assert(blocks[1].kind == UPD_MD_HEADING2);
+        assert(blocks[1].spans.size() == 1 && blocks[1].spans[0].text == "What's New");
+        assert(blocks[2].kind == UPD_MD_BULLET);
+        assert(blocks[2].spans[1].kind == UPD_SPAN_BOLD && blocks[2].spans[1].text == "auto-update");
+        assert(blocks[2].spans[3].kind == UPD_SPAN_CODE && blocks[2].spans[3].text == "SHA-256");
+        assert(blocks[3].kind == UPD_MD_BULLET);
+        assert(blocks[3].spans[1].kind == UPD_SPAN_LINK);
+        assert(blocks[3].spans[1].text == "GitHub");
+        assert(blocks[3].spans[1].url == "https://github.com/didslima/PokeV-Recomp");
+        assert(blocks[4].kind == UPD_MD_QUOTE);
+        assert(blocks[4].spans[0].text == "Saves and mods remain untouched.");
+        assert(blocks[5].kind == UPD_MD_CODE);
+        assert(blocks[5].spans[0].text == "./PokeV-Recomp.AppImage");
+
+        // Verify prerelease channel flag in snapshot
+        set_env("LARECOMP_UPDATE_PRERELEASE", "1");
+        set_env("LARECOMP_UPDATE_TAG", "v0.1.1-rc.1");
+        updater_configure("v0.1.0", data_dir.c_str(), false, false);
+        updater_start_check(true);
+        UpdaterSnapshot ps = wait_check_done();
+        assert(ps.is_prerelease_channel == true);
+        set_env("LARECOMP_UPDATE_PRERELEASE", NULL);
+        set_env("LARECOMP_UPDATE_TAG", "v0.2.0");
+        updater_configure("v0.1.0", data_dir.c_str(), false, false);
+        updater_start_check(true);
+        ps = wait_check_done();
+        assert(ps.is_prerelease_channel == false);
+        printf("ok   markdown parser & prerelease channel flag\n");
+    }
+
     printf("PASS: updater phase A + B checks\n");
     return 0;
 }

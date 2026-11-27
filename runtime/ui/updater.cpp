@@ -394,6 +394,7 @@ UpdaterParseResult updater_parse_release_json_opts(const std::string &json, bool
         if (r <= -20000000000LL) return;
         if (!res.found_stable || r > updater_tag_rank(res.tag_name)) {
             res.found_stable = true;
+            res.is_prerelease = o.is_prerelease;
             res.tag_name = o.tag_name;
             res.html_url = sanitize_release_url(o.html_url, o.tag_name);
             res.body = o.body;
@@ -719,7 +720,8 @@ UpdaterSnapshot updater_get_snapshot() {
 static void set_check_result(UpdaterCheckState st, const std::string &tag,
                              const std::string &url, const std::string &notes,
                              const std::string &linux_url, uint64_t linux_size,
-                             const std::string &sums_url, const std::string &err) {
+                             const std::string &sums_url, const std::string &err,
+                             bool prerelease_ch = false) {
     if (g_shutting_down.load()) return;
     pthread_mutex_lock(&g_upd_lock);
     if (!g_shutting_down.load()) {
@@ -731,6 +733,7 @@ static void set_check_result(UpdaterCheckState st, const std::string &tag,
         g_snap.linux_asset_size = linux_size;
         g_snap.sha256sums_url = sums_url;
         g_snap.error = err;
+        g_snap.is_prerelease_channel = prerelease_ch;
         g_snap.has_checked = true;
     }
     pthread_mutex_unlock(&g_upd_lock);
@@ -899,21 +902,25 @@ static void *check_thread(void *) {
         return NULL;
     }
     if (!parsed.found_stable) {
-        set_check_result(UPD_CHK_UP_TO_DATE, cur_ver, GITHUB_RELEASES_WEB, "", "", 0, "", "");
+        set_check_result(UPD_CHK_UP_TO_DATE, cur_ver, GITHUB_RELEASES_WEB, "", "", 0, "", "",
+                         include_prerelease);
         g_upd_running = false;
         return NULL;
     }
 
+    bool prerelease_ch = include_prerelease || parsed.is_prerelease;
     long long cur_rank = updater_tag_rank(cur_ver);
     long long lat_rank = updater_tag_rank(parsed.tag_name);
     if (lat_rank > cur_rank) {
         fprintf(stderr, "[updater] update available: %s (installed %s)\n",
                 parsed.tag_name.c_str(), cur_ver.c_str());
         set_check_result(UPD_CHK_AVAILABLE, parsed.tag_name, parsed.html_url, parsed.body,
-                         parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "");
+                         parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "",
+                         prerelease_ch);
     } else {
         set_check_result(UPD_CHK_UP_TO_DATE, parsed.tag_name, parsed.html_url, parsed.body,
-                         parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "");
+                         parsed.linux_asset_url, parsed.linux_asset_size, parsed.sha256sums_url, "",
+                         prerelease_ch);
     }
 
     g_upd_running = false;
@@ -1309,4 +1316,168 @@ void updater_shutdown() {
     if (join_inst) pthread_join(t_inst, NULL);
     g_upd_running = false;
     g_inst_running = false;
+}
+
+static std::vector<UpdaterMdSpan> parse_inline_spans(const std::string &s) {
+    std::vector<UpdaterMdSpan> out;
+    auto push_text = [&](const std::string &t) {
+        if (t.empty()) return;
+        if (!out.empty() && out.back().kind == UPD_SPAN_TEXT) {
+            out.back().text += t;
+        } else {
+            UpdaterMdSpan sp;
+            sp.kind = UPD_SPAN_TEXT;
+            sp.text = t;
+            out.push_back(sp);
+        }
+    };
+
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        if (s[i] == '`') {
+            size_t end = s.find('`', i + 1);
+            if (end != std::string::npos && end > i + 1) {
+                UpdaterMdSpan sp;
+                sp.kind = UPD_SPAN_CODE;
+                sp.text = s.substr(i + 1, end - i - 1);
+                out.push_back(sp);
+                i = end + 1;
+                continue;
+            }
+        }
+        if (i + 1 < n && ((s[i] == '*' && s[i + 1] == '*') || (s[i] == '_' && s[i + 1] == '_'))) {
+            std::string delim = s.substr(i, 2);
+            size_t end = s.find(delim, i + 2);
+            if (end != std::string::npos && end > i + 2) {
+                UpdaterMdSpan sp;
+                sp.kind = UPD_SPAN_BOLD;
+                sp.text = s.substr(i + 2, end - i - 2);
+                out.push_back(sp);
+                i = end + 2;
+                continue;
+            }
+        }
+        if (s[i] == '[') {
+            size_t rb = s.find(']', i + 1);
+            if (rb != std::string::npos && rb + 1 < n && s[rb + 1] == '(') {
+                size_t rp = s.find(')', rb + 2);
+                if (rp != std::string::npos) {
+                    std::string label = s.substr(i + 1, rb - i - 1);
+                    std::string url = s.substr(rb + 2, rp - rb - 2);
+                    if (!label.empty() &&
+                        (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0)) {
+                        UpdaterMdSpan sp;
+                        sp.kind = UPD_SPAN_LINK;
+                        sp.text = label;
+                        sp.url = url;
+                        out.push_back(sp);
+                        i = rp + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        push_text(s.substr(i, 1));
+        ++i;
+    }
+    return out;
+}
+
+static bool is_md_hr(const std::string &t) {
+    if (t.size() < 3) return false;
+    char ch = t[0];
+    if (ch != '-' && ch != '*' && ch != '_') return false;
+    for (char c : t) {
+        if (c != ch && c != ' ') return false;
+    }
+    return true;
+}
+
+std::vector<UpdaterMdBlock> updater_parse_markdown(const std::string &md) {
+    std::vector<UpdaterMdBlock> blocks;
+    bool in_code = false;
+    std::string code_buf;
+
+    size_t pos = 0, len = md.size();
+    while (pos <= len) {
+        size_t nl = md.find('\n', pos);
+        if (nl == std::string::npos) nl = len;
+        std::string line = md.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        pos = (nl == len) ? (len + 1) : (nl + 1);
+
+        // Trim leading spaces for block detection (preserve indentation inside code blocks)
+        size_t first_ns = line.find_first_not_of(" \t");
+        std::string trimmed = (first_ns == std::string::npos) ? "" : line.substr(first_ns);
+
+        if (trimmed.rfind("```", 0) == 0) {
+            if (!in_code) {
+                in_code = true;
+                code_buf.clear();
+            } else {
+                in_code = false;
+                if (!code_buf.empty()) {
+                    UpdaterMdBlock b;
+                    b.kind = UPD_MD_CODE;
+                    UpdaterMdSpan sp;
+                    sp.kind = UPD_SPAN_CODE;
+                    sp.text = code_buf;
+                    b.spans.push_back(sp);
+                    blocks.push_back(b);
+                    code_buf.clear();
+                }
+            }
+            continue;
+        }
+
+        if (in_code) {
+            if (!code_buf.empty()) code_buf += "\n";
+            code_buf += line;
+            continue;
+        }
+
+        if (trimmed.empty() || is_md_hr(trimmed)) {
+            continue;
+        }
+
+        UpdaterMdBlock b;
+        std::string content = trimmed;
+
+        if (trimmed[0] == '#') {
+            size_t hashes = 0;
+            while (hashes < trimmed.size() && trimmed[hashes] == '#') ++hashes;
+            if (hashes < trimmed.size() && (trimmed[hashes] == ' ' || trimmed[hashes] == '\t')) {
+                if (hashes == 1) b.kind = UPD_MD_HEADING1;
+                else if (hashes == 2) b.kind = UPD_MD_HEADING2;
+                else b.kind = UPD_MD_HEADING3;
+                size_t cs = trimmed.find_first_not_of(" \t", hashes);
+                content = (cs == std::string::npos) ? "" : trimmed.substr(cs);
+            }
+        } else if (trimmed[0] == '>') {
+            b.kind = UPD_MD_QUOTE;
+            size_t cs = trimmed.find_first_not_of(" \t", 1);
+            content = (cs == std::string::npos) ? "" : trimmed.substr(cs);
+        } else if (trimmed.size() >= 2 &&
+                   (trimmed[0] == '-' || trimmed[0] == '*' || trimmed[0] == '+') &&
+                   (trimmed[1] == ' ' || trimmed[1] == '\t')) {
+            b.kind = UPD_MD_BULLET;
+            size_t cs = trimmed.find_first_not_of(" \t", 1);
+            content = (cs == std::string::npos) ? "" : trimmed.substr(cs);
+        }
+
+        b.spans = parse_inline_spans(content);
+        if (!b.spans.empty()) blocks.push_back(b);
+    }
+
+    if (in_code && !code_buf.empty()) {
+        UpdaterMdBlock b;
+        b.kind = UPD_MD_CODE;
+        UpdaterMdSpan sp;
+        sp.kind = UPD_SPAN_CODE;
+        sp.text = code_buf;
+        b.spans.push_back(sp);
+        blocks.push_back(b);
+    }
+
+    return blocks;
 }

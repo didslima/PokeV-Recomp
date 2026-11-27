@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 enum UpdaterCheckState {
     UPD_CHK_IDLE = 0,
@@ -39,6 +40,7 @@ struct UpdaterSnapshot {
     std::string error;
     bool suppressed_by_launcher = false;
     bool has_checked = false;
+    bool is_prerelease_channel = false;
 
     // Phase B: Linux AppImage install state
     UpdaterInstallKind install_kind = UPD_INSTALL_UNSUPPORTED;
@@ -63,6 +65,7 @@ std::string updater_find_curl();
 struct UpdaterParseResult {
     bool ok = false;
     bool found_stable = false;
+    bool is_prerelease = false;
     std::string tag_name;
     std::string html_url;
     std::string body;
@@ -70,6 +73,37 @@ struct UpdaterParseResult {
     uint64_t linux_asset_size = 0;
     std::string sha256sums_url;
 };
+
+enum UpdaterMdBlockKind {
+    UPD_MD_PARAGRAPH = 0,
+    UPD_MD_HEADING1,
+    UPD_MD_HEADING2,
+    UPD_MD_HEADING3,
+    UPD_MD_BULLET,
+    UPD_MD_QUOTE,
+    UPD_MD_CODE,
+};
+
+enum UpdaterMdSpanKind {
+    UPD_SPAN_TEXT = 0,
+    UPD_SPAN_BOLD,
+    UPD_SPAN_CODE,
+    UPD_SPAN_LINK,
+};
+
+struct UpdaterMdSpan {
+    UpdaterMdSpanKind kind = UPD_SPAN_TEXT;
+    std::string text;
+    std::string url;
+};
+
+struct UpdaterMdBlock {
+    UpdaterMdBlockKind kind = UPD_MD_PARAGRAPH;
+    std::vector<UpdaterMdSpan> spans;
+};
+
+// Parse GitHub Markdown release notes into clean blocks/spans (strips #, **, >, `, and [label](url)).
+std::vector<UpdaterMdBlock> updater_parse_markdown(const std::string &md);
 
 // Parse GitHub /releases/latest object (or /releases array), ignoring draft entries and (by default) prereleases.
 UpdaterParseResult updater_parse_release_json(const std::string &json);

@@ -3182,12 +3182,29 @@ extern "C" void launcher_run(const char *root) {
                         retry_click = true;
                     }
 
+                    auto draw_alert_triangle = [](ImDrawList *draw, ImVec2 center, float r, ImU32 fill_col, ImU32 excl_col) {
+                        ImVec2 p0(center.x, center.y - r * 0.92f);
+                        ImVec2 p1(center.x - r * 0.96f, center.y + r * 0.78f);
+                        ImVec2 p2(center.x + r * 0.96f, center.y + r * 0.78f);
+                        draw->AddTriangleFilled(p0, p1, p2, fill_col);
+                        draw->AddTriangle(p0, p1, p2, fill_col, std::max(1.2f, r * 0.14f));
+                        float bar_w = std::max(1.5f, r * 0.18f);
+                        draw->AddLine(ImVec2(center.x, center.y - r * 0.34f),
+                                      ImVec2(center.x, center.y + r * 0.22f), excl_col, bar_w);
+                        draw->AddCircleFilled(ImVec2(center.x, center.y + r * 0.48f),
+                                              std::max(1.1f, r * 0.12f), excl_col);
+                    };
+
                     if (!link.empty()) {
                         ImVec2 ls = text_size(F_LABEL, 14, link.c_str());
                         float lx2 = right_x - ls.x, ly2 = H_ - 24 - ls.y / 2;
                         ImGui::SetCursorScreenPos(P(lx2, ly2));
                         bool click = ui_invisible_button("##update", S(ls.x, ls.y), ImGuiButtonFlags_EnableNav);
                         bool hover = item_hot();
+                        if (us.state == UPD_CHK_AVAILABLE) {
+                            draw_alert_triangle(dl, P(lx2 - 14.0f, H_ - 24.0f), 7.5f * g_s,
+                                                hover ? col_hi : col, IM_COL32(20, 22, 28, 255));
+                        }
                         text(dl, F_LABEL, 14, lx2, ly2, hover ? col_hi : col, link.c_str());
                         if (hover) {
                             dl->AddLine(P(lx2, ly2 + ls.y), P(lx2 + ls.x, ly2 + ls.y), col_hi, 1.2f * g_s);
@@ -3197,7 +3214,7 @@ extern "C" void launcher_run(const char *root) {
                             if (retry_click) updater_start_check(true);
                             else if (open_notes_modal) ImGui::OpenPopup("##updnotes");
                         }
-                        right_x = lx2 - 24;
+                        right_x = lx2 - (us.state == UPD_CHK_AVAILABLE ? 36 : 24);
                     }
                 }
                 std::string done_tag = !updated.empty() ? updated : us.updated_from_tag;
@@ -3209,31 +3226,166 @@ extern "C" void launcher_run(const char *root) {
                     text(dl, F_LABEL, 14, mx, my, C_TEAL, m.c_str());
                 }
 
+                float modal_w = std::min(880.0f, std::max(360.0f, W_ - 60.0f));
+                float modal_h = std::min(580.0f, std::max(300.0f, H_ - 60.0f));
                 ImGui::SetNextWindowPos(P(W_ / 2, H_ / 2), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                ImGui::SetNextWindowSize(S(640, 460), ImGuiCond_Appearing);
-                if (ImGui::BeginPopupModal("##updnotes", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::SetNextWindowSize(S(modal_w, modal_h), ImGuiCond_Always);
+                if (ImGui::BeginPopupModal("##updnotes", NULL, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize)) {
                     UpdaterSnapshot ms = updater_get_snapshot();
                     ImGui::PushFont(g_font_menu);
-                    if (ms.state == UPD_CHK_AVAILABLE)
-                        ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s",
+                    if (ms.state == UPD_CHK_AVAILABLE) {
+                        float tri_r = 9.5f * g_s;
+                        ImVec2 cur = ImGui::GetCursorScreenPos();
+                        float line_h = ImGui::GetTextLineHeight();
+                        draw_alert_triangle(ImGui::GetWindowDrawList(),
+                                            ImVec2(cur.x + tri_r, cur.y + line_h * 0.5f),
+                                            tri_r, IM_COL32(255, 194, 82, 255), IM_COL32(24, 26, 32, 255));
+                        ImGui::Dummy(ImVec2(tri_r * 2.2f, line_h));
+                        ImGui::SameLine(0.0f, 8.0f * g_s);
+                        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.36f, 1.0f), "%s",
                                            (std::string(TR("Update Available: ", "Atualização disponível: ")) +
                                             updater_tag_label(ms.latest_tag, true)).c_str());
-                    else
+                    } else {
                         ImGui::Text("%s", TR("PokeV-Recomp Updates", "Atualizações do PokeV-Recomp"));
+                    }
                     ImGui::PopFont();
-                    ImGui::Text(TR("Installed: %s   |   Latest stable: %s", "Instalada: %s   |   Última estável: %s"),
-                                ms.current_version.c_str(),
-                                ms.latest_tag.empty() ? "-" : ms.latest_tag.c_str());
+                    if (ms.is_prerelease_channel) {
+                        ImGui::Text(TR("Installed: %s   |   Latest pre-release: %s",
+                                       "Instalada: %s   |   Último pré-lançamento: %s"),
+                                    ms.current_version.c_str(),
+                                    ms.latest_tag.empty() ? "-" : ms.latest_tag.c_str());
+                    } else {
+                        ImGui::Text(TR("Installed: %s   |   Latest stable: %s",
+                                       "Instalada: %s   |   Última estável: %s"),
+                                    ms.current_version.c_str(),
+                                    ms.latest_tag.empty() ? "-" : ms.latest_tag.c_str());
+                    }
                     if (!ms.error.empty())
                         ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", ms.error.c_str());
                     if (!ms.install_error.empty())
                         ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", ms.install_error.c_str());
                     ImGui::Spacing();
-                    ImGui::BeginChild("##upd_body", S(600, 220), true);
-                    if (!ms.notes.empty())
-                        ImGui::TextWrapped("%s", ms.notes.c_str());
-                    else
+                    float body_h = std::max(140.0f * g_s,
+                                            ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing() * 2.7f);
+                    ImGui::BeginChild("##upd_body", ImVec2(0.0f, body_h), true);
+                    if (!ms.notes.empty()) {
+                        std::vector<UpdaterMdBlock> blocks = updater_parse_markdown(ms.notes);
+                        int link_id = 0;
+                        auto render_spans = [&](const std::vector<UpdaterMdSpan> &spans, float indent_px, ImVec4 base_col) {
+                            float start_x = ImGui::GetCursorPosX() + indent_px;
+                            float max_x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 8.0f * g_s;
+                            ImGui::SetCursorPosX(start_x);
+                            bool first_on_line = true;
+                            for (const UpdaterMdSpan &sp : spans) {
+                                ImVec4 col_sp = base_col;
+                                if (sp.kind == UPD_SPAN_BOLD) col_sp = ImVec4(1.0f, 0.95f, 0.78f, 1.0f);
+                                else if (sp.kind == UPD_SPAN_CODE) col_sp = ImVec4(0.62f, 0.94f, 0.86f, 1.0f);
+                                else if (sp.kind == UPD_SPAN_LINK) col_sp = ImVec4(0.45f, 0.82f, 1.0f, 1.0f);
+
+                                const std::string &txt = sp.text;
+                                size_t i = 0, n = txt.size();
+                                while (i < n) {
+                                    size_t j = i;
+                                    while (j < n && txt[j] != ' ') ++j;
+                                    while (j < n && txt[j] == ' ') ++j;
+                                    std::string tok = txt.substr(i, j - i);
+                                    i = j;
+                                    if (tok.empty()) continue;
+
+                                    float tok_w = ImGui::CalcTextSize(tok.c_str()).x;
+                                    float cur_x = ImGui::GetCursorPosX();
+                                    if (!first_on_line && cur_x + tok_w > max_x) {
+                                        ImGui::NewLine();
+                                        ImGui::SetCursorPosX(start_x);
+                                        size_t lead = tok.find_first_not_of(' ');
+                                        if (lead != std::string::npos) tok = tok.substr(lead);
+                                        else continue;
+                                        tok_w = ImGui::CalcTextSize(tok.c_str()).x;
+                                        first_on_line = true;
+                                    }
+
+                                    if (sp.kind == UPD_SPAN_CODE) {
+                                        ImVec2 p = ImGui::GetCursorScreenPos();
+                                        float lh = ImGui::GetTextLineHeight();
+                                        ImGui::GetWindowDrawList()->AddRectFilled(
+                                            ImVec2(p.x - 2.0f, p.y),
+                                            ImVec2(p.x + tok_w + 2.0f, p.y + lh),
+                                            IM_COL32(36, 48, 56, 210), 3.0f);
+                                    }
+
+                                    if (sp.kind == UPD_SPAN_LINK) {
+                                        ImVec2 p = ImGui::GetCursorScreenPos();
+                                        float lh = ImGui::GetTextLineHeight();
+                                        ImGui::PushID(link_id++);
+                                        bool clicked = ImGui::InvisibleButton("##mdlnk", ImVec2(std::max(4.0f, tok_w), lh));
+                                        bool hovered = ImGui::IsItemHovered();
+                                        ImGui::PopID();
+                                        ImU32 ucol = ImGui::GetColorU32(hovered ? ImVec4(0.68f, 0.92f, 1.0f, 1.0f) : col_sp);
+                                        ImGui::GetWindowDrawList()->AddText(p, ucol, tok.c_str());
+                                        ImGui::GetWindowDrawList()->AddLine(
+                                            ImVec2(p.x, p.y + lh - 1.0f),
+                                            ImVec2(p.x + tok_w, p.y + lh - 1.0f), ucol, 1.0f);
+                                        if (hovered) {
+                                            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                                            ImGui::SetTooltip("%s", sp.url.c_str());
+                                        }
+                                        if (clicked) SDL_OpenURL(sp.url.c_str());
+                                    } else {
+                                        ImGui::TextColored(col_sp, "%s", tok.c_str());
+                                    }
+                                    ImGui::SameLine(0.0f, 0.0f);
+                                    first_on_line = false;
+                                }
+                            }
+                            ImGui::NewLine();
+                        };
+
+                        for (size_t bi = 0; bi < blocks.size(); ++bi) {
+                            const UpdaterMdBlock &b = blocks[bi];
+                            if (b.kind == UPD_MD_HEADING1) {
+                                if (bi > 0) ImGui::Spacing();
+                                ImGui::PushFont(g_font_menu);
+                                render_spans(b.spans, 0.0f, ImVec4(1.0f, 0.85f, 0.45f, 1.0f));
+                                ImGui::PopFont();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                            } else if (b.kind == UPD_MD_HEADING2) {
+                                if (bi > 0) ImGui::Spacing();
+                                ImGui::PushFont(g_font_menu);
+                                render_spans(b.spans, 0.0f, ImVec4(0.45f, 0.92f, 0.88f, 1.0f));
+                                ImGui::PopFont();
+                            } else if (b.kind == UPD_MD_HEADING3) {
+                                if (bi > 0) ImGui::Spacing();
+                                render_spans(b.spans, 0.0f, ImVec4(0.95f, 0.95f, 1.0f, 1.0f));
+                            } else if (b.kind == UPD_MD_BULLET) {
+                                ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.88f, 1.0f), "•");
+                                ImGui::SameLine(0.0f, 6.0f * g_s);
+                                render_spans(b.spans, 4.0f * g_s, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                            } else if (b.kind == UPD_MD_QUOTE) {
+                                ImVec2 qp = ImGui::GetCursorScreenPos();
+                                float qy0 = qp.y + 2.0f;
+                                ImGui::BeginGroup();
+                                render_spans(b.spans, 14.0f * g_s, ImVec4(0.76f, 0.84f, 0.90f, 1.0f));
+                                ImGui::EndGroup();
+                                float qy1 = ImGui::GetItemRectMax().y - 2.0f;
+                                ImGui::GetWindowDrawList()->AddRectFilled(
+                                    ImVec2(qp.x + 2.0f, qy0),
+                                    ImVec2(qp.x + 5.0f * g_s, std::max(qy0 + 6.0f, qy1)),
+                                    IM_COL32(90, 210, 195, 220), 2.0f);
+                                ImGui::Spacing();
+                            } else if (b.kind == UPD_MD_CODE) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.68f, 0.92f, 0.85f, 1.0f));
+                                if (!b.spans.empty())
+                                    ImGui::TextWrapped("%s", b.spans[0].text.c_str());
+                                ImGui::PopStyleColor();
+                                ImGui::Spacing();
+                            } else {
+                                render_spans(b.spans, 0.0f, ImVec4(0.90f, 0.92f, 0.95f, 1.0f));
+                            }
+                        }
+                    } else {
                         ImGui::TextDisabled("%s", TR("No release notes available.", "Nenhuma nota de lançamento disponível."));
+                    }
                     ImGui::EndChild();
                     ImGui::Spacing();
 
