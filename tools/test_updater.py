@@ -604,46 +604,60 @@ int main() {
         assert(ws.install_state == UPD_INST_FAILED);
         set_env("LARECOMP_UPDATE_MIN_FREE_BYTES", nullptr);
 
-        // Boot recovery restores interrupted update from .PokeV-Recomp.update.bak
+        // Interrupted update with .bak + marker flags external recovery_pending & blocks Play
         fs::create_directories(win_dir + "\\.PokeV-Recomp.update.bak");
         wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\PokeV-Recomp.exe", "restored-exe");
+        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\SDL3.dll", "restored-sdl3");
         wbytes(win_dir + "\\.PokeV-Recomp.update-in-progress", "v0.2.0");
-        wbytes(win_dir + "\\.PokeV-Recomp.update-error.txt", "Simulated rollback notice");
-        fs::remove(win_dir + "\\PokeV-Recomp.exe");
         updater_configure("v0.1.1", win_dir.c_str(), false, false);
         ws = updater_get_snapshot();
-        assert(rbytes(win_dir + "\\PokeV-Recomp.exe") == "restored-exe");
-        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
-        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
-        assert(ws.install_error == "Simulated rollback notice");
-
-        // Partial boot recovery (locked DLL): preserves .bak & marker, sets error, refuses update, then succeeds on 2nd launch
-        fs::create_directories(win_dir + "\\.PokeV-Recomp.update.bak");
-        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\PokeV-Recomp.exe", "restored-exe-2");
-        wbytes(win_dir + "\\.PokeV-Recomp.update.bak\\SDL3.dll", "restored-sdl3-2");
-        wbytes(win_dir + "\\.PokeV-Recomp.update-in-progress", "v0.2.0");
-        std::wstring sdl_w = fs::u8path(win_dir + "\\SDL3.dll").wstring();
-        HANDLE hLockDll = CreateFileW(sdl_w.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        assert(hLockDll != INVALID_HANDLE_VALUE);
-        updater_configure("v0.1.1", win_dir.c_str(), false, false);
-        ws = updater_get_snapshot();
-        assert(ws.install_state == UPD_INST_FAILED);
-        assert(ws.install_error.find(".PokeV-Recomp.update.bak") != std::string::npos);
+        assert(ws.recovery_pending == true);
+        assert(ws.recovery_blocked == true);
+        assert(updater_is_recovery_blocked() == true);
+        assert(ws.install_kind == UPD_INSTALL_UNSUPPORTED);
+        // Must NOT have modified EXE/DLL in-process or deleted .bak
+        assert(rbytes(win_dir + "\\PokeV-Recomp.exe") == "old-exe");
         assert(fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
         assert(fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
-        assert(ws.install_kind == UPD_INSTALL_UNSUPPORTED);
-        CloseHandle(hLockDll);
 
-        // Second launch after lock released completes recovery cleanly
+        // Missing helper binary fails recovery launch cleanly and keeps Play blocked
+        fs::remove(win_dir + "\\PokeV-Recomp-updater.exe");
+        assert(!updater_launch_windows_recovery_and_exit_ready());
+        ws = updater_get_snapshot();
+        assert(ws.recovery_blocked == true);
+        assert(updater_is_recovery_blocked() == true);
+        assert(ws.install_state == UPD_INST_FAILED);
+        assert(ws.install_error.find(".PokeV-Recomp.update.bak") != std::string::npos);
+        wbytes(win_dir + "\\PokeV-Recomp-updater.exe", "old-upd");
+
+        // Inconsistent markers: .update-in-progress without .bak AND missing critical file -> blocks Play
+        fs::remove_all(win_dir + "\\.PokeV-Recomp.update.bak");
+        fs::remove(win_dir + "\\zig\\zig.exe");
         updater_configure("v0.1.1", win_dir.c_str(), false, false);
         ws = updater_get_snapshot();
-        assert(ws.install_state == UPD_INST_IDLE);
-        assert(ws.install_kind == UPD_INSTALL_WINDOWS_ZIP);
-        assert(rbytes(win_dir + "\\PokeV-Recomp.exe") == "restored-exe-2");
-        assert(rbytes(win_dir + "\\SDL3.dll") == "restored-sdl3-2");
-        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update.bak"));
+        assert(ws.recovery_pending == false);
+        assert(ws.recovery_blocked == true);
+        assert(updater_is_recovery_blocked() == true);
+        assert(ws.install_state == UPD_INST_FAILED);
+        assert(fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
+
+        // Inconsistent markers: .update-in-progress without .bak, all critical files intact -> cleans marker & unblocks
+        wbytes(win_dir + "\\zig\\zig.exe", "old-zig");
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        ws = updater_get_snapshot();
+        assert(ws.recovery_pending == false);
+        assert(ws.recovery_blocked == false);
+        assert(updater_is_recovery_blocked() == false);
         assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-in-progress"));
+        assert(!ws.update_notice.empty());
+        assert(ws.install_kind == UPD_INSTALL_WINDOWS_ZIP);
+
+        // Post-recovery notice marker surfaced and cleaned on next boot
+        wbytes(win_dir + "\\.PokeV-Recomp.update-notice.txt", "Restored cleanly");
+        updater_configure("v0.1.1", win_dir.c_str(), false, false);
+        ws = updater_get_snapshot();
+        assert(ws.update_notice == "Restored cleanly");
+        assert(!fs::exists(win_dir + "\\.PokeV-Recomp.update-notice.txt"));
 
         // Unicode Windows install & ZIP path test
         std::string uni_zip_path = tmp + "\\Jo\xC3\xA3o Caf\xC3\xA9 \xC3\x81rea\\release.zip";
@@ -1011,6 +1025,123 @@ def test_windows_helper_e2e(cxx: str):
                 msvcrt.locking(locked_f.fileno(), msvcrt.LK_UNLCK, 1)
         assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3"
         print("ok   windows helper locked-file rejection preserves installation")
+
+        # 5. External --recover mode: full recovery, user data preserved, relaunch & no relaunch loop
+        def setup_interrupted_bak(target_dir: Path):
+            shutil.rmtree(target_dir, ignore_errors=True)
+            for sub in ["gamelib-src", "zaimport", "zig", "lasgen", "zaprompts", "save", "mods", "extracted"]:
+                (target_dir / sub).mkdir(parents=True, exist_ok=True)
+            bdir = target_dir / ".PokeV-Recomp.update.bak"
+            (bdir / "zig").mkdir(parents=True, exist_ok=True)
+            # Partially updated install_dir (new SDL3.dll, missing zig.exe) + old files in .bak
+            shutil.copy2(dummy_exe, bdir / "PokeV-Recomp.exe")
+            (bdir / "SDL3.dll").write_bytes(b"old-sdl3-bak")
+            (bdir / "zig" / "zig.exe").write_bytes(b"old-zig-bak")
+            shutil.copy2(dummy_exe, target_dir / "PokeV-Recomp.exe")
+            (target_dir / "SDL3.dll").write_bytes(b"partial-new-sdl3")
+            (target_dir / "za-default.ini").write_bytes(b"old-def")
+            (target_dir / "recomplauncher.json").write_bytes(b"{}")
+            (target_dir / "gamelib-src" / "gamelib_entry.c").write_bytes(b"old")
+            (target_dir / "zaimport" / "zaimport.exe").write_bytes(b"old")
+            (target_dir / "lasgen" / "lasgen.exe").write_bytes(b"old")
+            (target_dir / "zaprompts" / "zaprompts.exe").write_bytes(b"old")
+            (target_dir / "save" / "slot.bin").write_bytes(b"user-save")
+            (target_dir / "larecomp.ini").write_bytes(b"user-ini=1\n")
+            (target_dir / "mods" / "m.pak").write_bytes(b"user-mod")
+            (target_dir / "extracted" / "romfs.bin").write_bytes(b"user-romfs")
+            (target_dir / "unknown_user.txt").write_bytes(b"keep-me")
+            (target_dir / ".PokeV-Recomp.update-in-progress").write_bytes(b"v0.2.0")
+            (target_dir / ".PokeV-Recomp.update.lock").write_bytes(b"999999\n")
+            return bdir, target_dir / ".PokeV-Recomp.update.lock"
+
+        # 5a. Full --recover in Unicode + spaces path (independent of CWD)
+        uni_inst = t / "João Café Área (Spaces)"
+        ubak, ulock = setup_interrupted_bak(uni_inst)
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(uni_inst), str(ubak), str(ulock), "5000", "1",
+        ], cwd=str(t), timeout=15)
+        assert res.returncode == 0
+        for _ in range(40):
+            if (uni_inst / "relaunched.txt").is_file():
+                break
+            time.sleep(0.05)
+        assert (uni_inst / "relaunched.txt").is_file()
+        assert (uni_inst / "SDL3.dll").read_bytes() == b"old-sdl3-bak"
+        assert (uni_inst / "zig" / "zig.exe").read_bytes() == b"old-zig-bak"
+        assert (uni_inst / "save" / "slot.bin").read_bytes() == b"user-save"
+        assert (uni_inst / "larecomp.ini").read_bytes() == b"user-ini=1\n"
+        assert (uni_inst / "mods" / "m.pak").read_bytes() == b"user-mod"
+        assert (uni_inst / "extracted" / "romfs.bin").read_bytes() == b"user-romfs"
+        assert (uni_inst / "unknown_user.txt").read_bytes() == b"keep-me"
+        assert (uni_inst / ".PokeV-Recomp.update-notice.txt").is_file()
+        # No relaunch loop: markers & backup are gone after recovery
+        assert not (uni_inst / ".PokeV-Recomp.update-in-progress").exists()
+        assert not ubak.exists()
+        assert not ulock.exists()
+        print("ok   windows --recover e2e (unicode/spaces, restore, user data preserved, relaunch, no loop)")
+
+        # 5b. Locked DLL during --recover preserves backup & markers and does NOT relaunch
+        ubak, ulock = setup_interrupted_bak(inst)
+        with open(inst / "SDL3.dll", "r+b") as locked_f:
+            import msvcrt
+            msvcrt.locking(locked_f.fileno(), msvcrt.LK_NBLCK, 1)
+            try:
+                res = subprocess.run([
+                    str(helper_exe), "--recover", "0", "0",
+                    str(inst), str(ubak), str(ulock), "500", "1",
+                ], timeout=15)
+                assert res.returncode == 3
+                assert ubak.is_dir()
+                assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+                assert (inst / ".PokeV-Recomp.update-error.txt").is_file()
+                assert not (inst / "relaunched.txt").exists()
+            finally:
+                locked_f.seek(0)
+                msvcrt.locking(locked_f.fileno(), msvcrt.LK_UNLCK, 1)
+        print("ok   windows --recover locked DLL preserves backup & markers, no relaunch")
+
+        # 5c. Interrupted 1st recovery (only some files left in .bak) -> 2nd --recover completes cleanly
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "5000", "1",
+        ], timeout=15)
+        assert res.returncode == 0
+        for _ in range(40):
+            if (inst / "relaunched.txt").is_file():
+                break
+            time.sleep(0.05)
+        assert (inst / "relaunched.txt").is_file()
+        assert (inst / "SDL3.dll").read_bytes() == b"old-sdl3-bak"
+        assert not ubak.exists()
+        assert not (inst / ".PokeV-Recomp.update-in-progress").exists()
+        print("ok   windows --recover 2nd attempt after lock/interruption completes cleanly")
+
+        # 5d. Missing/empty .bak fails cleanly without relaunch
+        ubak, ulock = setup_interrupted_bak(inst)
+        shutil.rmtree(ubak)
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "500", "1",
+        ], timeout=10)
+        assert res.returncode == 11
+        assert (inst / ".PokeV-Recomp.update-error.txt").is_file()
+        assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+        assert not (inst / "relaunched.txt").exists()
+        print("ok   windows --recover missing backup fails safely without relaunch")
+
+        # 5e. Validation failure after restore (missing zig.exe) keeps marker and does NOT relaunch
+        ubak, ulock = setup_interrupted_bak(inst)
+        (ubak / "zig" / "zig.exe").unlink()
+        res = subprocess.run([
+            str(helper_exe), "--recover", "0", "0",
+            str(inst), str(ubak), str(ulock), "500", "1",
+        ], timeout=10)
+        assert res.returncode == 7
+        assert (inst / ".PokeV-Recomp.update-error.txt").is_file()
+        assert (inst / ".PokeV-Recomp.update-in-progress").is_file()
+        assert not (inst / "relaunched.txt").exists()
+        print("ok   windows --recover validation failure blocks relaunch and keeps markers")
 
 
 def main():
