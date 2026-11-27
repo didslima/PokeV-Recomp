@@ -563,6 +563,9 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         if (b->scalable && (b->ax != g_al_x || b->ay != g_al_y)) {  // output resolution changed: reallocate
+            b->is_movie = false;
+            b->movie_boxed = false;
+            b->movie_w = b->movie_h = 0;
             destroy_image(b);
             create_image(t, b);
         }
@@ -929,6 +932,7 @@ static void upload_pending(TexBackend *b) {
     pthread_mutex_unlock(&pending_lock);
     if (!px) return;
     b->is_movie = true;
+    b->movie_boxed = false;
     b->movie_w = w;
     b->movie_h = h;
     if (nv12) { vk_convert_nv12(b, px, w, h, stride, uv_off); free(px); return; }
@@ -1192,9 +1196,11 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     if (for_render) {
         b->gpu_owned = true;
         b->is_movie = false;
+        b->movie_boxed = false;
         b->movie_w = b->movie_h = 0;
     } else if (!b->gpu_owned) {
         b->is_movie = false;
+        b->movie_boxed = false;
         b->movie_w = b->movie_h = 0;
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
@@ -1235,6 +1241,7 @@ void renderer_mark_gpu_owned(NvnTexture *t) {
     TexBackend *b = tex_backend(t);
     b->gpu_owned = true;
     b->is_movie = false;
+    b->movie_boxed = false;
     b->movie_w = b->movie_h = 0;
     if (b->scalable) { b->sx = g_rs_x; b->sy = g_rs_y; }
 }
@@ -1254,6 +1261,7 @@ static void upload_rgba_now(NvnTexture *t, const void *rgba, uint32_t w, uint32_
     b->pending_nv12 = false;
     b->gpu_owned = true;
     b->is_movie = true;
+    b->movie_boxed = false;
     b->movie_w = w;
     b->movie_h = h;
     pthread_mutex_unlock(&pending_lock);
@@ -1306,6 +1314,7 @@ static bool upload_nv12_now(NvnTexture *t, const void *nv12, uint32_t w, uint32_
     b->pending_uv_off = uv_off;
     b->gpu_owned = true;
     b->is_movie = true;
+    b->movie_boxed = false;
     b->movie_w = w;
     b->movie_h = h;
     pthread_mutex_unlock(&pending_lock);
