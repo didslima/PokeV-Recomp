@@ -226,6 +226,8 @@ typedef struct TexBackend {
     uint32_t pending_w, pending_h, pending_stride;
     bool pending_nv12;        // pending_rgba holds NV12 (Y, then UV at pending_uv_off): converted on the GPU
     uint32_t pending_uv_off;
+    bool is_movie;            // true when populated by movie.c decoded video; cleared on normal guest/GPU reuse
+    uint32_t movie_w, movie_h;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
     int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1

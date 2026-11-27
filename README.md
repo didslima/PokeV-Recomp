@@ -88,6 +88,11 @@ finished and has only been tested on one machine (Intel Arc B580, Xeon E5-2650 v
 - Only *Pokémon Violet* 4.0.0 is recognised. *Pokémon Scarlet* is not supported yet.
 - **Linux is barely tested.** Releases include an AppImage built automatically from the same code. A contributor
   started it and checked the setup on Bazzite (RTX 5070 Ti); nobody has reported a full play session yet. Reports are welcome ([docs/linux.md](docs/linux.md) lists what to include).
+- **Character profile photograph aspect ratio distortion** (*Open / Needs investigation*):
+  - **Location**: Uva Academy Enrollment Application screen, early game.
+  - **Description & reproduction**: During character creation at the beginning of the game, the character profile photograph appears squashed/distorted.
+  - **Comparison & classification**: Reproduces identically both with and without `LARECOMP_WIDE_MOVIE_BOX=0` (pre-existing issue, unrelated to the ultrawide pre-rendered cutscene fix).
+  - **Suggested investigation**: Trace the profile image texture dimensions, upload path, and rendering viewport/scaling behavior.
 
 Every fix and its validation state is logged in
 [HISTORICO_CORRECOES_E_DESENVOLVIMENTO.md](HISTORICO_CORRECOES_E_DESENVOLVIMENTO.md) (in Portuguese).

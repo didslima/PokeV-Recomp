@@ -434,6 +434,7 @@ typedef struct {
     bool eos_pending;
     int64_t eos_time;
     bool stopped;  // Stop / destroyed: no more events (see dec_stop)
+    bool cpu_video_out;  // true if video frames were delivered via guest CPU memory rather than texture output
     pthread_mutex_t lock;
 } Decoder;
 
@@ -546,6 +547,7 @@ static void dec_stop(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     if (!d->stopped) {
         d->stopped = true;
+        d->cpu_video_out = false;
         LOG("[movie] decoder %s stopped\n", d->video ? "video" : "audio");
         uint64_t saved[8];
         memcpy(saved, c->x, sizeof saved);
@@ -746,6 +748,7 @@ static void dec_get_output_buffer(Cpu *c) {
     b->base = (uint64_t)(uintptr_t)d->out_mem[i];
     b->capacity = d->out_cap;
     b->size = (int32_t)d->out_size[i];
+    if (d->video && d->out_size[i] > 0) d->cpu_video_out = true;
     c->x[0] = 0;
 }
 
@@ -800,6 +803,22 @@ RT_ON_RESET(movie_reset) {
     g_ex_vt = g_dec_vt = 0;
     g_nbuf_pool = 0;  // (the HLE heap starts over)
     g_skip_held = false, g_skip_pressed_at = 0;
+}
+
+bool movie_cpu_video_active(uint32_t *w, uint32_t *h) {
+    bool found = false;
+    pthread_mutex_lock(&g_movie_lock);
+    for (int i = 0; i < MAX_MOVIE_OBJS; i++) {
+        Decoder *d = g_movie_objs[1][i];
+        if (d && d->video && !d->stopped && d->cpu_video_out && d->width > 0 && d->height > 0) {
+            if (w) *w = (uint32_t)d->width;
+            if (h) *h = (uint32_t)d->height;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_movie_lock);
+    return found;
 }
 
 static void dec_get_counts(Cpu *c) {  // slot 14: (int*, int64*) queried after Configure
