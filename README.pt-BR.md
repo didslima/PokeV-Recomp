@@ -94,6 +94,11 @@ terminado e só foi testado em uma máquina (Intel Arc B580, Xeon E5-2650 v4, Wi
   código. Um contribuidor o abriu e conferiu a preparação no Bazzite (RTX 5070 Ti); ninguém relatou uma sessão de
   jogo completa ainda. Relatos são bem-vindos ([docs/linux.md](docs/linux.md) lista o
   que incluir).
+- **Distorção de proporção na foto de perfil do personagem** (*Em aberto / Necessita investigação*):
+  - **Local**: Tela do Formulário de Matrícula da Academia Uva (*Uva Academy Enrollment Application*), no início do jogo.
+  - **Descrição e reprodução**: Durante a criação de personagem no início do jogo, a foto de perfil do personagem aparece achatada/distorcida.
+  - **Comparação e classificação**: Reproduz de forma idêntica com e sem `LARECOMP_WIDE_MOVIE_BOX=0` (problema preexistente, sem relação com a correção de cutscenes ultrawide).
+  - **Investigação sugerida**: Rastrear as dimensões da textura da foto de perfil, o caminho de upload e o comportamento de viewport/escala na renderização.
 
 Cada correção e o estado da sua validação ficam registrados em
 [HISTORICO_CORRECOES_E_DESENVOLVIMENTO.md](HISTORICO_CORRECOES_E_DESENVOLVIMENTO.md).
