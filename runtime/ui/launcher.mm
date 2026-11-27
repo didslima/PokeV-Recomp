@@ -3135,6 +3135,18 @@ extern "C" void launcher_run(const char *root) {
                 pthread_mutex_unlock(&g_update_lock);
                 float right_x = W_ - 28;
                 UpdaterSnapshot us = updater_get_snapshot();
+                auto draw_alert_triangle = [](ImDrawList *draw, ImVec2 center, float r, ImU32 fill_col, ImU32 excl_col) {
+                    ImVec2 p0(center.x, center.y - r * 0.92f);
+                    ImVec2 p1(center.x - r * 0.96f, center.y + r * 0.78f);
+                    ImVec2 p2(center.x + r * 0.96f, center.y + r * 0.78f);
+                    draw->AddTriangleFilled(p0, p1, p2, fill_col);
+                    draw->AddTriangle(p0, p1, p2, fill_col, std::max(1.2f, r * 0.14f));
+                    float bar_w = std::max(1.5f, r * 0.18f);
+                    draw->AddLine(ImVec2(center.x, center.y - r * 0.34f),
+                                  ImVec2(center.x, center.y + r * 0.22f), excl_col, bar_w);
+                    draw->AddCircleFilled(ImVec2(center.x, center.y + r * 0.48f),
+                                          std::max(1.1f, r * 0.12f), excl_col);
+                };
                 if (!(us.suppressed_by_launcher && !us.has_checked) && ust == UPD_IDLE) {
                     std::string link;
                     ImU32 col = C_MUTED;
@@ -3181,19 +3193,6 @@ extern "C" void launcher_run(const char *root) {
                         link = TR("Check for updates", "Verificar atualizações");
                         retry_click = true;
                     }
-
-                    auto draw_alert_triangle = [](ImDrawList *draw, ImVec2 center, float r, ImU32 fill_col, ImU32 excl_col) {
-                        ImVec2 p0(center.x, center.y - r * 0.92f);
-                        ImVec2 p1(center.x - r * 0.96f, center.y + r * 0.78f);
-                        ImVec2 p2(center.x + r * 0.96f, center.y + r * 0.78f);
-                        draw->AddTriangleFilled(p0, p1, p2, fill_col);
-                        draw->AddTriangle(p0, p1, p2, fill_col, std::max(1.2f, r * 0.14f));
-                        float bar_w = std::max(1.5f, r * 0.18f);
-                        draw->AddLine(ImVec2(center.x, center.y - r * 0.34f),
-                                      ImVec2(center.x, center.y + r * 0.22f), excl_col, bar_w);
-                        draw->AddCircleFilled(ImVec2(center.x, center.y + r * 0.48f),
-                                              std::max(1.1f, r * 0.12f), excl_col);
-                    };
 
                     if (!link.empty()) {
                         ImVec2 ls = text_size(F_LABEL, 14, link.c_str());
