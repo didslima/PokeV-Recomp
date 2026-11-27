@@ -8048,10 +8048,84 @@ static void movie_box_rect(uint32_t movie_w, uint32_t movie_h, float *vx, float 
         *vh = bh;
     }
 }
+static uint64_t movie_boxed_frame = ~0ull;
+static uint32_t movie_boxed_w = 0, movie_boxed_h = 0;
+
+// Scissor rect for presenting a frame with a boxed movie: keeps only the centred native-aspect region so any
+// non-black pixels written outside it by later passes cannot overwrite the swapchain's black bars, even if
+// per-texture movie_boxed metadata was lost in an intermediate pass.
+static bool movie_boxed_present_scissor(const TexBackend *b, float vx, float vy, float vw, float vh,
+                                        uint32_t sc_w, uint32_t sc_h, VkRect2D *out) {
+    if (!movie_box_enabled() || !sc_w || !sc_h || !(vw > 0.0f) || !(vh > 0.0f)) return false;
+    extern uint64_t renderer_exec_frame(void);
+    uint32_t mw = 0, mh = 0;
+    if (b && b->is_movie && b->movie_boxed && b->movie_w && b->movie_h) {
+        mw = b->movie_w; mh = b->movie_h;
+    } else if ((!b || !b->is_movie || b->movie_boxed) &&
+               movie_boxed_frame == renderer_exec_frame() && movie_boxed_w && movie_boxed_h) {
+        mw = movie_boxed_w; mh = movie_boxed_h;
+    } else {
+        return false;
+    }
+    float bx = vx, by = vy, bw = vw, bh = vh;
+    movie_box_rect(mw, mh, &bx, &by, &bw, &bh);
+    if (bw >= vw - 0.5f && bh >= vh - 0.5f) return false;
+    int32_t x0 = (int32_t)lroundf(bx), y0 = (int32_t)lroundf(by);
+    int32_t x1 = (int32_t)lroundf(bx + bw), y1 = (int32_t)lroundf(by + bh);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int32_t)sc_w) x1 = (int32_t)sc_w;
+    if (y1 > (int32_t)sc_h) y1 = (int32_t)sc_h;
+    if (x1 <= x0 || y1 <= y0) return false;
+    *out = (VkRect2D){{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+    return true;
+}
+// Half-resolution chroma plane check for CPU-decoded planar YCbCr video (exact, odd-rounded, or 16-aligned).
+static bool movie_chroma_half_ok(uint32_t cw, uint32_t ch, uint32_t w, uint32_t h) {
+    bool w_ok = cw == w / 2 || cw == (w + 1) / 2 || cw == (((w / 2) + 15u) & ~15u);
+    bool h_ok = ch == h / 2 || ch == (h + 1) / 2 || ch == (((h / 2) + 15u) & ~15u);
+    return w_ok && h_ok;
+}
+// Detect CPU-decoded planar YCbCr video draws (e.g. Bink Y/Cb/Cr[/A] or NV12 Y+UV) uploaded from guest memory
+// (!gpu_owned) and drawn as a 2D fullscreen quad without going through movie.c (nnMedia).
+static bool movie_planar_ycbcr_match(int ntex, TexBackend *const *tbs, const uint32_t (*wh)[2],
+                                     uint32_t *out_w, uint32_t *out_h) {
+    if (ntex < 2 || ntex > 4) return false;
+    uint32_t max_w = 0, max_h = 0;
+    for (int i = 0; i < ntex; i++) {
+        const TexBackend *b = tbs[i];
+        if (!b || b->gpu_owned || b->levels != 1 || b->layers != 1 || b->samples != 1 ||
+            b->aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+            return false;
+        if (wh[i][0] > max_w) { max_w = wh[i][0]; max_h = wh[i][1]; }
+    }
+    if (max_w < 320 || max_h < 180) return false;
+    if (ntex == 2) {
+        int y_idx = (tbs[0]->format == VK_FORMAT_R8_UNORM && wh[0][0] == max_w && wh[0][1] == max_h) ? 0
+                  : (tbs[1]->format == VK_FORMAT_R8_UNORM && wh[1][0] == max_w && wh[1][1] == max_h) ? 1 : -1;
+        if (y_idx < 0) return false;
+        int uv_idx = 1 - y_idx;
+        if (tbs[uv_idx]->format != VK_FORMAT_R8G8_UNORM ||
+            !movie_chroma_half_ok(wh[uv_idx][0], wh[uv_idx][1], max_w, max_h))
+            return false;
+        *out_w = max_w; *out_h = max_h;
+        return true;
+    }
+    int full_r8 = 0, half_r8 = 0;
+    for (int i = 0; i < ntex; i++) {
+        if (tbs[i]->format != VK_FORMAT_R8_UNORM) return false;
+        if (wh[i][0] == max_w && wh[i][1] == max_h) full_r8++;
+        else if (movie_chroma_half_ok(wh[i][0], wh[i][1], max_w, max_h)) half_r8++;
+        else return false;
+    }
+    if (half_r8 != 2 || (full_r8 != 1 && full_r8 != 2)) return false;
+    *out_w = max_w; *out_h = max_h;
+    return true;
+}
 // Identify pre-rendered video draws, apply aspect-ratio boxing on reshaped passes, and propagate metadata only for clean
 // fullscreen 1:1 passes (never mixing video with gameplay/UI). Returns true when the draw is a movie draw in a reshaped pass.
 static bool movie_draw_apply(VkCommandBuffer cb, TexBackend *rt0, uint32_t ncolor, int ntex, TexBackend *const *tbs,
-                             const uint32_t (*wh)[2], bool video_draw_ok, bool reshaped) {
+                             const uint32_t (*wh)[2], bool quad_full_vp, bool video_draw_ok, bool reshaped) {
     if (!movie_box_enabled() || !ncolor) return false;
     bool found = false, src_boxed = false;
     uint32_t mw = 0, mh = 0;
@@ -8074,6 +8148,9 @@ static bool movie_draw_apply(VkCommandBuffer cb, TexBackend *rt0, uint32_t ncolo
             }
         }
     }
+    if (!found && quad_full_vp && movie_planar_ycbcr_match(ntex, tbs, wh, &mw, &mh)) {
+        found = true; src_boxed = false;
+    }
     if (!found) {
         pass_cur()->has_non_movie_draw = true;
         if (rt0 && rt0->is_movie && !rt0->movie_boxed) {
@@ -8082,11 +8159,15 @@ static bool movie_draw_apply(VkCommandBuffer cb, TexBackend *rt0, uint32_t ncolo
         return false;
     }
     if (reshaped) {
+        extern uint64_t renderer_exec_frame(void);
         if (!src_boxed) {
             vp_box_aspect((float)mw / (float)mh);
             clear_movie_bars(cb);
         }
-        if (rt0 && (!pass_cur()->has_non_movie_draw || !src_boxed)) {
+        movie_boxed_frame = renderer_exec_frame();
+        movie_boxed_w = mw;
+        movie_boxed_h = mh;
+        if (rt0 && (!pass_cur()->has_non_movie_draw || !src_boxed || quad_full_vp)) {
             rt0->is_movie = true; rt0->movie_boxed = true; rt0->movie_w = mw; rt0->movie_h = mh;
         }
         return true;
@@ -8594,13 +8675,14 @@ static void draw_(CmdRec *r, bool indexed) {
             NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
             ftbs[i] = t ? (TexBackend *)t->backend : NULL;
         }
+        bool quad_full_vp = r->x[2] <= 6 && st.viewport[0][0] <= 1.0f && st.viewport[0][1] <= 1.0f &&
+                            st.viewport[0][2] >= (float)st.rt.color[0]->width * 0.99f &&
+                            fabsf(st.viewport[0][3]) >= (float)st.rt.color[0]->height * 0.99f;
         bool depth_test = st.ds[0] && st.rt.depth && compare_fn(st.ds[2]) != VK_COMPARE_OP_ALWAYS;
-        bool video_draw_ok = r->x[2] <= 6 && !depth_test && st.viewport[0][0] <= 1.0f && st.viewport[0][1] <= 1.0f &&
-                             st.viewport[0][2] >= (float)st.rt.color[0]->width * 0.99f &&
-                             fabsf(st.viewport[0][3]) >= (float)st.rt.color[0]->height * 0.99f;
+        bool video_draw_ok = quad_full_vp && !depth_test;
         bool reshaped = fabsf(pass_sx - pass_sy) > 0.01f * pass_sy;
         movie_boxed = movie_draw_apply(cb, (TexBackend *)st.rt.color[0]->backend, st.rt.ncolor, ntex, ftbs, tex_wh[1],
-                                       video_draw_ok, reshaped);
+                                       quad_full_vp, video_draw_ok, reshaped);
     }
     if (!movie_boxed && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
@@ -11552,8 +11634,15 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     memcpy(pc, pv, 32);
     screen_filter_params(pc + 8);
     rec_CmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    VkRect2D movie_sc;
+    bool has_movie_sc = movie_boxed_present_scissor(b, vx, vy, vw, vh, g_vk.sc_extent.width, g_vk.sc_extent.height, &movie_sc);
+    if (has_movie_sc) rec_CmdSetScissor(cb, 0, 1, &movie_sc);
     fullscreen_vertex_bind(cb);
     rec_CmdDraw(cb, 3, 1, 0, 0);
+    if (has_movie_sc) {
+        VkRect2D full_sc = {{0, 0}, {g_vk.sc_extent.width, g_vk.sc_extent.height}};
+        rec_CmdSetScissor(cb, 0, 1, &full_sc);
+    }
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     rec_CmdSetViewport(cb, 0, 1, &full);
 }
