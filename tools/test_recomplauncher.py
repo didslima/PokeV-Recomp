@@ -520,9 +520,17 @@ static bool dlc_stamp_matches(const std::string &root, const std::vector<std::st
     return have == dlc_stamp_for(dlcs);
 }
 
+static void make_dir(const char *p) {
+#ifdef _WIN32
+    mkdir(p);
+#else
+    mkdir(p, 0755);
+#endif
+}
+
 static void write_dlc_stamp(const std::string &root, const std::vector<std::string> &dlcs) {
     if (dlcs.empty()) return;
-    mkdir((root + "/aoc").c_str(), 0755);
+    make_dir((root + "/aoc").c_str());
     FILE *f = fopen((root + "/aoc/.dlc_stamp").c_str(), "wb");
     assert(f);
     std::string stamp = dlc_stamp_for(dlcs);
@@ -545,7 +553,7 @@ int main(int argc, char **argv) {
     assert(dlc_stamp_matches(root, one) == false);
 
     // 3. Simulate incremental import of dlc1 (creates aoc/01008f6008c5f001.bin + .dlc_stamp)
-    mkdir((root + "/aoc").c_str(), 0755);
+    make_dir((root + "/aoc").c_str());
     FILE *b1 = fopen((root + "/aoc/01008f6008c5f001.bin").c_str(), "wb");
     fwrite("DLC1", 1, 4, b1);
     fclose(b1);
