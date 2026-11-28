@@ -96,7 +96,8 @@ uint64_t renderer_exec_frame(void) { return 0; }
 extern bool widescreen_frame_boxed(uint64_t frame);
 extern bool widescreen_ui_boxed(const float *u, uint64_t size);
 extern bool widescreen_ui_boxed_draw(const float *u, uint64_t size, int ntex,
-                                     const float (*tex_sc)[2], const uint32_t (*tex_wh)[2]);
+                                     const float (*tex_sc)[2], const uint32_t (*tex_wh)[2],
+                                     const bool *tex_gpu);
 extern bool widescreen_ui_pane_partial(const float *u, uint64_t size);
 extern void widescreen_set_factor(float f);
 extern float rt_sv_proj_aspect(float aspect);
@@ -145,27 +146,38 @@ int main(void) {
     pane[19] = 0.0f; pane[23] = 0.0f;
     pane[132] = 1920.0f; pane[133] = 1080.0f; pane[134] = -960.0f; pane[135] = 540.0f;
     ok = ok && !widescreen_ui_boxed(pane, sizeof pane);
-    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 0, NULL, NULL);
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 0, NULL, NULL, NULL);
 
     /* Fullscreen 560-byte pane with static 16:9 artwork (Title Screen, DLC promo) MUST be boxed */
     const float sc_static[1][2] = {{1.0f, 1.0f}};
     const uint32_t wh_1080[1][2] = {{1920, 1080}};
     const uint32_t wh_720[1][2] = {{1280, 720}};
-    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_1080);
-    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_720);
+    const bool gpu_false[1] = {false};
+    const bool gpu_true[1] = {true};
+    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_1080, NULL);
+    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_1080, gpu_false);
+    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_720, gpu_false);
+
+    /* Fullscreen 560-byte pane with GPU-owned 1920x1080 snapshot (cutscene transition) must NOT be boxed */
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_1080, gpu_true);
+    const float sc_static2[2][2] = {{1.0f, 1.0f}, {1.0f, 1.0f}};
+    const uint32_t wh_1080_2[2][2] = {{1920, 1080}, {1920, 1080}};
+    const bool gpu_mixed[2] = {false, true};
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 2, sc_static2, wh_1080_2, gpu_mixed);
 
     /* Fullscreen 560-byte pane with reshaped ultrawide RT or non-16:9 / tiny texture must NOT be boxed */
     const float sc_wide[1][2] = {{4.0f, 2.0f}};
     const uint32_t wh_540[1][2] = {{960, 540}};
     const uint32_t wh_sq[1][2] = {{1024, 1024}};
     const uint32_t wh_tiny[1][2] = {{16, 9}};
-    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_wide, wh_540);
-    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_sq);
-    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_tiny);
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_wide, wh_540, NULL);
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_sq, NULL);
+    ok = ok && !widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_tiny, NULL);
 
-    /* Partial pane (logo / button / minimap) stays boxed via widescreen_ui_boxed_draw even with ntex=0 */
+    /* Partial pane (logo / button / minimap) stays boxed via widescreen_ui_boxed_draw even with ntex=0 or gpu_owned */
     pane[132] = 720.0f; pane[133] = 432.0f; pane[134] = -360.0f; pane[135] = 216.0f;
-    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 0, NULL, NULL);
+    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 0, NULL, NULL, NULL);
+    ok = ok && widescreen_ui_boxed_draw(pane, sizeof pane, 1, sc_static, wh_1080, gpu_true);
 
     /* 128-byte font text draw must be boxed */
     float text[32] = {0};
