@@ -101,9 +101,13 @@ static bool ui_text_draw(const float *u, uint64_t size) {
     float sx = u[0] * 960, sy = fabsf(u[5]) * 540;
     return sx > 0.05f && sx < 20 && fabsf(sx - sy) < 1e-3f * sx;
 }
-static bool ui_static_16_9_tex(int ntex, const float (*tex_sc)[2], const uint32_t (*tex_wh)[2]) {
+static bool ui_static_16_9_tex(int ntex, const float (*tex_sc)[2], const uint32_t (*tex_wh)[2],
+                               const bool *tex_gpu) {
     if (ntex <= 0 || !tex_sc || !tex_wh) return false;
     for (int i = 0; i < ntex; i++) {
+        // GPU-owned textures (rendered or copied on the GPU, e.g. cutscene transition snapshots) hold
+        // scene-aspect content rather than static 16:9 UI artwork, even when sized 1920x1080.
+        if (tex_gpu && tex_gpu[i]) return false;
         float sx = tex_sc[i][0], sy = tex_sc[i][1];
         if (!(sx > 0) || !(sy > 0) || fabsf(sx - sy) > 0.01f * sy) return false;
     }
@@ -115,10 +119,11 @@ bool widescreen_ui_boxed(const float *u, uint64_t size) {
     return ui_box_enabled() && (widescreen_ui_pane_partial(u, size) || ui_text_draw(u, size));
 }
 bool widescreen_ui_boxed_draw(const float *u, uint64_t size, int ntex,
-                              const float (*tex_sc)[2], const uint32_t (*tex_wh)[2]) {
+                              const float (*tex_sc)[2], const uint32_t (*tex_wh)[2],
+                              const bool *tex_gpu) {
     return ui_box_enabled() &&
            (widescreen_ui_pane_partial(u, size) || ui_text_draw(u, size) ||
-            (ui_pane_ortho(u, size) && ui_static_16_9_tex(ntex, tex_sc, tex_wh)));
+            (ui_pane_ortho(u, size) && ui_static_16_9_tex(ntex, tex_sc, tex_wh, tex_gpu)));
 }
 
 // Off in rooms that should keep 16:9 framing (interiors, dungeons) -- see widescreen_update.
