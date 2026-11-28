@@ -962,6 +962,18 @@ static bool copy_save_tree(const std::string &src, const std::string &dst) {
 
 static std::string system_tar(void);
 static bool run_tool(const std::vector<const char *> &args, const char *log);
+static std::string save_root_dir(void) {
+    const char *sd = getenv("LARECOMP_SAVE_DIR");
+    if (sd && *sd) return std::string(sd);
+    char buf[128];
+    const GameIdentity *gid = game_identity_for_dir(g_root.c_str());
+    return game_identity_save_root(gid, buf, sizeof buf);
+}
+static std::string save_slot0_dir(void) { return save_root_dir() + "/save_0"; }
+static void ensure_save_root(const std::string &root) {
+    mkdir("save", 0755);
+    if (root != "save") mkdir(root.c_str(), 0755);
+}
 static void import_save() {
     pthread_mutex_lock(&g_lock);
     std::string pick;
@@ -969,13 +981,14 @@ static void import_save() {
     pthread_mutex_unlock(&g_lock);
     if (pick.empty()) return;
     g_save_failed = true;
-    mkdir("save", 0755);
+    std::string sr = save_root_dir(), s0 = sr + "/save_0";
+    ensure_save_root(sr);
     std::string tmp;
-    if (!is_dir(pick)) {  // a file: a .zip of the save (JKSV can zip its backups), opened into save/.import
-        tmp = "save/.import";
+    if (!is_dir(pick)) {  // a file: a .zip of the save (JKSV can zip its backups), opened into <save_root>/.import
+        tmp = sr + "/.import";
         plat_remove_tree(tmp.c_str());
         mkdir(tmp.c_str(), 0755);
-        std::string tar = system_tar(), log = std::string(rt_data_root()) + "/save/.import.log";
+        std::string tar = system_tar(), log = std::string(rt_data_root()) + "/" + sr + "/.import.log";
         if (!run_tool({tar.c_str(), "-x", "-f", pick.c_str(), "-C", tmp.c_str()}, log.c_str())) {
             plat_remove_tree(tmp.c_str());
             g_save_msg = TR("That file couldn't be opened: choose the save's folder, or a .zip of it.",
@@ -994,19 +1007,19 @@ static void import_save() {
         return;
     }
     std::string backup;
-    if (is_dir("save/save_0")) {
+    if (is_dir(s0.c_str())) {
         char name[64];
         time_t now = time(NULL);
-        strftime(name, sizeof name, "save/backup-%Y%m%d-%H%M%S", localtime(&now));
-        backup = name;
-        if (rename("save/save_0", backup.c_str()) != 0) {
+        strftime(name, sizeof name, "backup-%Y%m%d-%H%M%S", localtime(&now));
+        backup = sr + "/" + name;
+        if (rename(s0.c_str(), backup.c_str()) != 0) {
             if (!tmp.empty()) plat_remove_tree(tmp.c_str());
             g_save_msg = TR("The current save couldn't be moved aside: nothing changed.",
                             "Não deu para guardar o save atual: nada mudou.");
             return;
         }
     }
-    bool ok = copy_save_tree(from, "save/save_0");
+    bool ok = copy_save_tree(from, s0);
     if (!tmp.empty()) plat_remove_tree(tmp.c_str());
     if (!ok) {
         g_save_msg = std::string(TR("The save couldn't be copied.", "Não deu para copiar o save.")) +
@@ -1323,7 +1336,7 @@ static void SDLCALL picked_mod(void *, const char *const *files, int) {
     if (files && files[0]) mod_install(files[0]);
 }
 
-// ------------------------------------------------------------------ saves (save/save_0, its backups beside it)
+// ------------------------------------------------------------------ saves (save/save_0 for Violet, save/scarlet/save_0 for Scarlet)
 struct SaveBackup { std::string dir; time_t when; };
 static std::vector<SaveBackup> g_backups;
 static time_t g_save_time;
@@ -1333,19 +1346,17 @@ static std::string g_export_pick;
 
 static void saves_scan(void) {
     g_save_time = 0, g_save_bytes = 0;
-    // (the save the game plays: LARECOMP_SAVE_DIR as runtime/services/fs.c, else the data root's - as party_load)
-    const char *sd = getenv("LARECOMP_SAVE_DIR");
-    std::string s0 = sd && *sd ? std::string(sd) + "/save_0" : std::string("save/save_0");
+    std::string sr = save_root_dir(), s0 = sr + "/save_0";
     if (is_dir(s0.c_str())) tree_stat(s0.c_str(), g_save_time, g_save_bytes);
     g_backups.clear();
-    if (DIR *d = opendir("save")) {
+    if (DIR *d = opendir(sr.c_str())) {
         while (struct dirent *e = readdir(d)) {
             int Y, M, D, h, m, sec;
             if (sscanf(e->d_name, "backup-%4d%2d%2d-%2d%2d%2d", &Y, &M, &D, &h, &m, &sec) != 6) continue;
             struct tm tm = {};
             tm.tm_year = Y - 1900, tm.tm_mon = M - 1, tm.tm_mday = D, tm.tm_hour = h, tm.tm_min = m, tm.tm_sec = sec;
             tm.tm_isdst = -1;
-            g_backups.push_back({std::string("save/") + e->d_name, mktime(&tm)});
+            g_backups.push_back({sr + "/" + e->d_name, mktime(&tm)});
         }
         closedir(d);
     }
@@ -1355,20 +1366,25 @@ static void saves_scan(void) {
 // the current save moved aside as a dated backup ("" when there was none; false: it couldn't be)
 static bool save_set_aside(std::string &backup) {
     backup.clear();
-    if (!is_dir("save/save_0")) return true;
+    std::string sr = save_root_dir(), s0 = sr + "/save_0";
+    if (!is_dir(s0.c_str())) return true;
+    ensure_save_root(sr);
     char name[64];
     time_t now = time(NULL);
-    strftime(name, sizeof name, "save/backup-%Y%m%d-%H%M%S", localtime(&now));
-    backup = name;
-    for (int i = 2; file_exists(backup); i++) backup = std::string(name) + "-" + std::to_string(i);
-    return rename("save/save_0", backup.c_str()) == 0;
+    strftime(name, sizeof name, "backup-%Y%m%d-%H%M%S", localtime(&now));
+    std::string base = sr + "/" + name;
+    backup = base;
+    for (int i = 2; file_exists(backup); i++) backup = base + "-" + std::to_string(i);
+    return rename(s0.c_str(), backup.c_str()) == 0;
 }
 static void save_restore(const std::string &dir) {
     std::string backup;
     g_save_failed = true;
     if (!save_set_aside(backup)) { g_save_msg = TR("The current save couldn't be moved aside: nothing changed.",
                                                    "Não deu para guardar o save atual: nada mudou."); return; }
-    if (!copy_save_tree(dir, "save/save_0")) {
+    std::string sr = save_root_dir(), s0 = sr + "/save_0";
+    ensure_save_root(sr);
+    if (!copy_save_tree(dir, s0)) {
         g_save_msg = TR("The backup couldn't be copied.", "Não deu para copiar o backup.");
         return;
     }
@@ -1391,10 +1407,11 @@ static void save_export(void) {
     pthread_mutex_unlock(&g_lock);
     if (out.empty()) return;
     if (lower(out).size() < 4 || lower(out).compare(lower(out).size() - 4, 4, ".zip")) out += ".zip";
-    std::string tar = system_tar(), log = std::string(rt_data_root()) + "/save/.export.log";
+    std::string sr = save_root_dir();
+    std::string tar = system_tar(), log = std::string(rt_data_root()) + "/" + sr + "/.export.log";
     remove(out.c_str());
     // -a: the archive type from the name (.zip)
-    bool ok = run_tool({tar.c_str(), "-a", "-c", "-f", out.c_str(), "-C", "save", "save_0"}, log.c_str());
+    bool ok = run_tool({tar.c_str(), "-a", "-c", "-f", out.c_str(), "-C", sr.c_str(), "save_0"}, log.c_str());
     if (ok) remove(log.c_str());
     g_save_failed = !ok;
     g_save_msg = ok ? std::string(TR("Save exported to ", "Save exportado para ")) + out
@@ -2027,10 +2044,8 @@ static int party_model(int species);
 static void party_load(void) {
     g_party.clear();
     g_party_time = g_save_time;
-    // (the save the game plays: LARECOMP_SAVE_DIR, as runtime/services/fs.c, else the data root's - the panel showed
-    // another team than the one played when a run pointed the game at a copy)
-    const char *sd = getenv("LARECOMP_SAVE_DIR");
-    std::string main_path = sd && *sd ? std::string(sd) + "/save_0/main" : std::string("save/save_0/main");
+    // (the save the game plays: LARECOMP_SAVE_DIR, as runtime/services/fs.c, else the active game's save_0)
+    std::string main_path = save_slot0_dir() + "/main";
     FILE *f = fopen(main_path.c_str(), "rb");
     if (!f) return;
     std::vector<uint8_t> p, blk;
@@ -2700,7 +2715,9 @@ extern "C" void launcher_run(const char *root) {
                                                  : TR("Set up the game files to play", "Prepare os arquivos do jogo para jogar")};
                 } else {
                     // ---- ready
-                    page_title(dl, x, 104, "POKÉMON VIOLET", TR("Ready to play", "Pronto para jogar"));
+                    const GameIdentity *gid = game_identity_for_dir(g_root.c_str());
+                    const char *title = (gid && strstr(gid->game, "Scarlet")) ? "POKÉMON SCARLET" : "POKÉMON VIOLET";
+                    page_title(dl, x, 104, title, TR("Ready to play", "Pronto para jogar"));
                     float ty = 196 + text(dl, F_BODY, 17, x, 196, C_SOFT, TR("Your game files are set up and the game's code "
                                                                               "is compiled for this PC.", "Os seus arquivos do "
                                                                               "jogo estão configurados e o código já foi "
@@ -2955,7 +2972,7 @@ extern "C" void launcher_run(const char *root) {
                 std::string cur = g_save_time ? std::string(TR("Saved ", "Salvo em ")) + fmt_time(g_save_time)
                                               : TR("No save yet", "Nenhum save ainda");
                 text(dl, F_H2, 20, x + 44, ly + 32, C_TEXT, cur.c_str());
-                if (g_save_time) text(dl, F_BODY, 13, x + 44, ly + 66, C_SOFT, (fmt_size(g_save_bytes) + " · save/save_0").c_str());
+                if (g_save_time) text(dl, F_BODY, 13, x + 44, ly + 66, C_SOFT, (fmt_size(g_save_bytes) + " · " + save_slot0_dir()).c_str());
                 ly += 112;
                 float bx = x + 26;
                 if (button("##import", TR("Import save...", "Importar save..."), bx, ly, 0, 46, BTN_PRIMARY, true, IC_UP_ARROW,
@@ -3775,7 +3792,7 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
                 if (pkgs.empty()) {
                     fprintf(stderr, "%s\n",
                             compressed ? "Your dump is compressed (.nsz / .xcz): decompress it to .nsp / .xci first."
-                                       : "No Pokémon Violet game files (.nsp, .xci, or exefs+romfs) found in that folder.");
+                                       : "No Pokémon Violet or Scarlet game files (.nsp, .xci, or exefs+romfs) found in that folder.");
                     return 1;
                 }
                 for (const auto &d : dlcs) {

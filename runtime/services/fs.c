@@ -33,7 +33,14 @@
 #define FS_TARGET_LOCKED MAKE_RESULT(2, 7)
 #define FS_NOT_EMPTY MAKE_RESULT(2, 8)
 
-const char *g_save_dir = "save";
+static char g_default_save_dir[128] = "save";
+const char *g_save_dir = g_default_save_dir;
+
+void fs_set_save_root(const char *dir) {
+    if (dir && *dir) snprintf(g_default_save_dir, sizeof g_default_save_dir, "%s", dir);
+    else snprintf(g_default_save_dir, sizeof g_default_save_dir, "save");
+    g_save_dir = g_default_save_dir;
+}
 
 // ------------------------------------------------------------------ the base RomFS image
 // The game reads its data as one raw RomFS image. It's served from the player's romfs/ folder: the header and tables
@@ -216,7 +223,7 @@ RT_ON_RESET(fs_reset) {
     rom_files = NULL, rom_nfiles = 0, rom_data_off = 0;
     base_close();
     mounts_reset();  // (the old boot's mounts are gone with it)
-    g_save_dir = "save";
+    g_save_dir = g_default_save_dir;
 }
 
 static int rom_cmp(const void *a, const void *b) {

@@ -3,8 +3,12 @@ Z-A's (tools/za_patches.py) and Link's Awakening's (tools/patches.py)."""
 import struct
 
 # main's build ID (first 16 hex digits) -> version
+# Binary diff of Scarlet 4.0.0 vs Violet 4.0.0 main NSOs: identical section sizes (.text/.rodata/.data/.bss),
+# .data 0 differing bytes, .rodata differing only in the 20-byte GNU Build ID, and .text differing in only 2 mov
+# immediates (0x700149b9c8, 0x700149b9d4). All 12 patch sites and 132-byte windows are byte-for-byte identical.
 SV_BUILDS = {
     '709bfd6611529864': '4.0.0',  # Pokémon Violet v786432 (4.0.0; called 3.0.1 here until v0.0.28, issue #3)
+    '421c5411b487eb4d': '4.0.0',  # Pokémon Scarlet v786432 (4.0.0)
 }
 
 

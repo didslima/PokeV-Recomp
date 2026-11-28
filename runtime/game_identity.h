@@ -1,8 +1,8 @@
 // Which game a set of game files is, from its exefs/main build ID (the NSO header's first 8 bytes at 0x40), and
 // whether PokeV-Recomp runs it. Header-only (C and C++: runtime/ui/launcher.mm, runtime/main.c, tools/test_game_identity.c).
 //
-// Only Pokémon Violet 4.0.0 is accepted (tools/sv_patches.py SV_BUILDS; until v0.0.27 the project took update
-// v786432 for 3.0.1 - its control.nacp says 4.0.0, issue #3). The other builds below are the
+// Only Pokémon Violet 4.0.0 and Pokémon Scarlet 4.0.0 are accepted (tools/sv_patches.py SV_BUILDS; until v0.0.27 the
+// project took update v786432 for 3.0.1 - its control.nacp says 4.0.0, issue #3). The other builds below are the
 // ones this runtime's ancestors (LAS Recomp, ZA Recomp, PokeL-ARecomp) set up: they are *recognised*, never accepted,
 // so the start screen can say "these are Pokémon Legends: Arceus's files" instead of offering to compile them. Before
 // v0.0.25 the start screen accepted all of them, and on Linux its data folder was PokeL-ARecomp's
@@ -15,20 +15,23 @@
 
 typedef struct {
     uint8_t id[8];
-    const char *game;     // for messages: "Pokémon Legends: Arceus"
-    const char *version;  // "1.1.1"
-    bool supported;       // PokeV-Recomp sets it up and compiles it
+    const char *game;        // for messages: "Pokémon Legends: Arceus"
+    const char *version;     // "1.1.1"
+    bool supported;          // PokeV-Recomp sets it up and compiles it
+    const char *save_subdir; // NULL/"" -> "save/save_0" (Violet default); "scarlet" -> "save/scarlet/save_0"
 } GameIdentity;
 
 static const GameIdentity GAME_IDENTITIES[] = {
-    // Pokémon Violet 4.0.0 (update v786432; title 01008F6008C5E000): the one game PokeV-Recomp runs
-    {{0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64}, "Pok\xc3\xa9mon Violet", "4.0.0", true},
+    // Pokémon Violet 4.0.0 (update v786432; title 01008F6008C5E000)
+    {{0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64}, "Pok\xc3\xa9mon Violet", "4.0.0", true, ""},
+    // Pokémon Scarlet 4.0.0 (update v786432; title 0100A3D008C5C000)
+    {{0x42, 0x1c, 0x54, 0x11, 0xb4, 0x87, 0xeb, 0x4d}, "Pok\xc3\xa9mon Scarlet", "4.0.0", true, "scarlet"},
     // recognised only (refused, with their name)
-    {{0xae, 0xe8, 0xf1, 0x50, 0xdd, 0xa1, 0xb5, 0xa8}, "Pok\xc3\xa9mon Legends: Arceus", "1.1.1", false},
-    {{0x72, 0x22, 0xe1, 0x3e, 0xcf, 0x6a, 0xdb, 0x32}, "Pok\xc3\xa9mon Legends: Z-A", "1.0.0", false},
-    {{0x8a, 0x1c, 0x86, 0xc4, 0x37, 0x39, 0x4b, 0x69}, "Pok\xc3\xa9mon Legends: Z-A", "2.0.0", false},
-    {{0xb1, 0xf1, 0x2f, 0xd9, 0x19, 0xea, 0xe8, 0x6a}, "Pok\xc3\xa9mon Legends: Z-A", "2.0.2", false},
-    {{0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0xcb}, "The Legend of Zelda: Link's Awakening", "1.0.0", false},
+    {{0xae, 0xe8, 0xf1, 0x50, 0xdd, 0xa1, 0xb5, 0xa8}, "Pok\xc3\xa9mon Legends: Arceus", "1.1.1", false, NULL},
+    {{0x72, 0x22, 0xe1, 0x3e, 0xcf, 0x6a, 0xdb, 0x32}, "Pok\xc3\xa9mon Legends: Z-A", "1.0.0", false, NULL},
+    {{0x8a, 0x1c, 0x86, 0xc4, 0x37, 0x39, 0x4b, 0x69}, "Pok\xc3\xa9mon Legends: Z-A", "2.0.0", false, NULL},
+    {{0xb1, 0xf1, 0x2f, 0xd9, 0x19, 0xea, 0xe8, 0x6a}, "Pok\xc3\xa9mon Legends: Z-A", "2.0.2", false, NULL},
+    {{0xae, 0x16, 0xf7, 0x1e, 0x00, 0x2a, 0xf8, 0xcb}, "The Legend of Zelda: Link's Awakening", "1.0.0", false, NULL},
 };
 
 // The known build an ID is (supported or not); NULL = unknown
@@ -60,4 +63,24 @@ static inline void game_identity_describe(const uint8_t id[8], char *out, size_t
     if (g) snprintf(out, n, "%s %s", g->game, g->version);
     else snprintf(out, n, "an unknown build (%02x%02x%02x%02x%02x%02x%02x%02x)", id[0], id[1], id[2], id[3], id[4],
                   id[5], id[6], id[7]);
+}
+
+// Save root relative to <data root> ("save" for Violet to preserve existing saves, "save/scarlet" for Scarlet).
+static inline const char *game_identity_save_root(const GameIdentity *g, char *out, size_t n) {
+    if (g && g->save_subdir && *g->save_subdir)
+        snprintf(out, n, "save/%s", g->save_subdir);
+    else
+        snprintf(out, n, "save");
+    return out;
+}
+
+// Look up the supported GameIdentity for a game directory (<game_dir>/exefs/main); NULL if missing or unsupported.
+static inline const GameIdentity *game_identity_for_dir(const char *game_dir) {
+    char main_path[1100];
+    uint8_t id[8];
+    if (!game_dir || !*game_dir) return NULL;
+    snprintf(main_path, sizeof main_path, "%s/exefs/main", game_dir);
+    if (!game_identity_read(main_path, id)) return NULL;
+    const GameIdentity *g = game_identity_find(id);
+    return (g && g->supported) ? g : NULL;
 }
