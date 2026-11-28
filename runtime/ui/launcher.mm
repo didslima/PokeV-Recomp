@@ -539,7 +539,7 @@ static bool g_import_mode;                               // Z-A packages: the ba
 // zaimport (tools/zaimport, shipped as zaimport/zaimport.exe) writes <root>/exefs, romfs.bin, aoc/; its progress
 // lines ("progress <done> <total>") go to the bar, its last line is the reason when it fails
 static bool import_packages(const std::vector<std::string> &pkgs, const std::string &keys, const std::string &title_keys,
-                            std::string &err) {
+                            std::string &err, bool aoc_only = false) {
     char tool[1100];
     if (!rt_resource("zaimport/zaimport" PLAT_EXE_SUFFIX, "build/zaimport/zaimport" PLAT_EXE_SUFFIX,
                      tool, sizeof tool)) {
@@ -548,6 +548,7 @@ static bool import_packages(const std::vector<std::string> &pkgs, const std::str
     }
     std::string log = g_root + "/import.log";
     std::vector<const char *> argv = {tool};
+    if (aoc_only) argv.push_back("--aoc-only");
     if (!title_keys.empty()) argv.push_back("--title-keys"), argv.push_back(title_keys.c_str());
     argv.push_back(keys.c_str());
     argv.push_back(g_root.c_str());
@@ -3593,7 +3594,97 @@ extern "C" void launcher_run(const char *root) {
 }
 
 // ------------------------------------------------------------------ windowless --prepare (RecompLauncher setup step)
+static std::string parent_dir_or_dot(const std::string &p) {
+    size_t slash = p.find_last_of("/\\");
+    return slash != std::string::npos ? p.substr(0, slash) : ".";
+}
+
+static bool resolve_prep_keys(const std::string &search_dir, const char *keys_path, const char *title_keys_path,
+                              std::string &keys, std::string &tkeys) {
+    std::string bad;
+    keys = (keys_path && *keys_path) ? keys_path : find_keys(search_dir, &bad);
+    if (keys.empty()) {
+        fprintf(stderr, "%s\n",
+                bad.empty() ? "prod.keys not found. Select your Switch prod.keys in Easy Setup or pass --keys=<path>."
+                            : ("\"" + bad + "\" is not a valid prod.keys (missing header_key).").c_str());
+        return false;
+    }
+    tkeys = (title_keys_path && *title_keys_path) ? title_keys_path : find_title_keys(search_dir, keys);
+    return true;
+}
+
+static std::string dlc_stamp_for(const std::vector<std::string> &dlcs) {
+    std::vector<std::string> sorted = dlcs;
+    std::sort(sorted.begin(), sorted.end());
+    std::string out;
+    for (const auto &p : sorted) {
+        struct stat sb;
+        char line[1280];
+        if (!stat(p.c_str(), &sb))
+            snprintf(line, sizeof line, "%s|%llu|%llu\n", p.c_str(), (unsigned long long)sb.st_size,
+                     (unsigned long long)sb.st_mtime);
+        else
+            snprintf(line, sizeof line, "%s|?|?\n", p.c_str());
+        out += line;
+    }
+    return out;
+}
+
+static bool aoc_has_bins(const std::string &root) {
+    DIR *d = opendir((root + "/aoc").c_str());
+    if (!d) return false;
+    bool found = false;
+    while (struct dirent *e = readdir(d)) {
+        size_t n = strlen(e->d_name);
+        if (n > 4 && !strcmp(e->d_name + n - 4, ".bin")) {
+            found = true;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static bool dlc_stamp_matches(const std::string &root, const std::vector<std::string> &dlcs) {
+    if (dlcs.empty()) return true;
+    if (!aoc_has_bins(root)) return false;
+    FILE *f = fopen((root + "/aoc/.dlc_stamp").c_str(), "rb");
+    if (!f) return false;
+    std::string have;
+    char buf[1024];
+    size_t k;
+    while ((k = fread(buf, 1, sizeof buf, f)) > 0) have.append(buf, k);
+    fclose(f);
+    return have == dlc_stamp_for(dlcs);
+}
+
+static void write_dlc_stamp(const std::string &root, const std::vector<std::string> &dlcs) {
+    if (dlcs.empty()) return;
+    mkdir((root + "/aoc").c_str(), 0755);
+    FILE *f = fopen((root + "/aoc/.dlc_stamp").c_str(), "wb");
+    if (!f) return;
+    std::string stamp = dlc_stamp_for(dlcs);
+    fwrite(stamp.data(), 1, stamp.size(), f);
+    fclose(f);
+}
+
+static bool import_aoc_packages(const std::vector<std::string> &dlcs, const char *keys_path, const char *title_keys_path,
+                                const char *game_path) {
+    std::string search_dir = !dlcs.empty() ? parent_dir_or_dot(dlcs[0])
+                                           : (game_path && *game_path ? parent_dir_or_dot(game_path) : ".");
+    std::string keys, tkeys, err;
+    if (!resolve_prep_keys(search_dir, keys_path, title_keys_path, keys, tkeys)) return false;
+    mkdir(g_root.c_str(), 0755);
+    if (!import_packages(dlcs, keys, tkeys, err, true)) {
+        fprintf(stderr, "%s\n", err.empty() ? "Failed to import DLC packages." : err.c_str());
+        return false;
+    }
+    write_dlc_stamp(g_root, dlcs);
+    return true;
+}
+
 extern "C" int launcher_prepare(const char *root, const char *game_path, const char *update_path,
+                                const char *const *dlc_paths, int dlc_count,
                                 const char *keys_path, const char *title_keys_path) {
     g_root = root ? root : "extracted";
     settings_load();
@@ -3602,7 +3693,28 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
         fprintf(stderr, "The data folder holds %s's files from another app; refusing to overwrite them.\n", foreign);
         return 1;
     }
+    std::vector<std::string> dlcs;
+    for (int i = 0; i < dlc_count; i++) {
+        if (dlc_paths && dlc_paths[i] && *dlc_paths[i]) {
+            std::string p = dlc_paths[i];
+            if (std::find(dlcs.begin(), dlcs.end(), p) == dlcs.end()) dlcs.push_back(p);
+        }
+    }
+    bool dlc_needed = !dlcs.empty() && !dlc_stamp_matches(g_root, dlcs);
     if (check_game_files(g_root).empty()) {
+        if (dlc_needed) {
+            printf("progress 0.05 Importing DLC packages...\n");
+            fflush(stdout);
+            if (!import_aoc_packages(dlcs, keys_path, title_keys_path, game_path)) return 1;
+            if (prompts_wanted()) {
+                printf("progress 0.94 Drawing controller button icons...\n");
+                fflush(stdout);
+                make_prompts(true);
+            }
+            printf("progress 1 Ready\n");
+            fflush(stdout);
+            return 0;
+        }
         if (prompts_wanted()) {
             printf("progress 0.94 Drawing controller button icons...\n");
             fflush(stdout);
@@ -3614,7 +3726,13 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
     }
     bool copied_ready = check_copied_files(g_root).empty();
     g_prep_base = copied_ready ? 0.0 : 0.25;
-    if (!copied_ready) {
+    if (copied_ready) {
+        if (dlc_needed) {
+            printf("progress 0.05 Importing DLC packages...\n");
+            fflush(stdout);
+            if (!import_aoc_packages(dlcs, keys_path, title_keys_path, game_path)) return 1;
+        }
+    } else {
         if (!game_path || !*game_path) {
             fprintf(stderr, "No game path provided. Select your Pokémon Violet 4.0.0 copy or pass --game=<path>.\n");
             return 1;
@@ -3645,6 +3763,11 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
                     fprintf(stderr, "Failed to copy exefs/romfs into the data folder.\n");
                     return 1;
                 }
+                if (!dlcs.empty()) {
+                    printf("progress 0.15 Importing DLC packages...\n");
+                    fflush(stdout);
+                    if (!import_aoc_packages(dlcs, keys_path, title_keys_path, game_path)) return 1;
+                }
             } else {
                 std::vector<std::string> pkgs;
                 int compressed = 0;
@@ -3655,15 +3778,11 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
                                        : "No Pokémon Violet game files (.nsp, .xci, or exefs+romfs) found in that folder.");
                     return 1;
                 }
-                std::string bad, keys = (keys_path && *keys_path) ? keys_path : find_keys(game_path, &bad);
-                if (keys.empty()) {
-                    fprintf(stderr, "%s\n",
-                            bad.empty() ? "prod.keys not found. Select your Switch prod.keys in Easy Setup or pass --keys=<path>."
-                                        : ("\"" + bad + "\" is not a valid prod.keys (missing header_key).").c_str());
-                    return 1;
+                for (const auto &d : dlcs) {
+                    if (std::find(pkgs.begin(), pkgs.end(), d) == pkgs.end()) pkgs.push_back(d);
                 }
-                std::string tkeys = (title_keys_path && *title_keys_path) ? title_keys_path : find_title_keys(game_path, keys);
-                std::string err;
+                std::string keys, tkeys, err;
+                if (!resolve_prep_keys(game_path, keys_path, title_keys_path, keys, tkeys)) return 1;
                 if (path_overlaps_dest(game_path, g_root.c_str())) {
                     fprintf(stderr, "Refusing to prepare: the source folder overlaps the data folder (%s).\n",
                             g_root.c_str());
@@ -3677,22 +3796,17 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
                     fprintf(stderr, "%s\n", err.empty() ? "Failed to import game packages." : err.c_str());
                     return 1;
                 }
+                write_dlc_stamp(g_root, dlcs);
             }
         } else {
             std::vector<std::string> pkgs = {game_path};
             if (update_path && *update_path) pkgs.push_back(update_path);
-            std::string dir = game_path;
-            size_t slash = dir.find_last_of("/\\");
-            dir = slash != std::string::npos ? dir.substr(0, slash) : ".";
-            std::string bad, keys = (keys_path && *keys_path) ? keys_path : find_keys(dir, &bad);
-            if (keys.empty()) {
-                fprintf(stderr, "%s\n",
-                        bad.empty() ? "prod.keys not found. Select your Switch prod.keys in Easy Setup or pass --keys=<path>."
-                                    : ("\"" + bad + "\" is not a valid prod.keys (missing header_key).").c_str());
-                return 1;
+            for (const auto &d : dlcs) {
+                if (std::find(pkgs.begin(), pkgs.end(), d) == pkgs.end()) pkgs.push_back(d);
             }
-            std::string tkeys = (title_keys_path && *title_keys_path) ? title_keys_path : find_title_keys(dir, keys);
-            std::string err;
+            std::string dir = parent_dir_or_dot(game_path);
+            std::string keys, tkeys, err;
+            if (!resolve_prep_keys(dir, keys_path, title_keys_path, keys, tkeys)) return 1;
             rt_remove_game_files(g_root.c_str());
             mkdir(g_root.c_str(), 0755);
             printf("progress 0.05 Importing game packages...\n");
@@ -3701,6 +3815,7 @@ extern "C" int launcher_prepare(const char *root, const char *game_path, const c
                 fprintf(stderr, "%s\n", err.empty() ? "Failed to import game packages." : err.c_str());
                 return 1;
             }
+            write_dlc_stamp(g_root, dlcs);
         }
         if (!build_id_ok(g_root + "/exefs/main")) {
             fprintf(stderr, "%s\n", build_id_detail(g_root + "/exefs/main").c_str());

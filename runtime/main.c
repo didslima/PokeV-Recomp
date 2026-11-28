@@ -328,9 +328,13 @@ int main(int argc, char **argv) {
     bool no_launcher = nl && *nl && strcmp(nl, "0");
     bool skip_launcher = no_launcher || getenv("LARECOMP_INPUT");  // tests boot straight in
     if (getenv("LARECOMP_FORCE_LAUNCHER")) skip_launcher = false;  // (test: the start screen, then the scripted input)
+#define MAX_PREP_DLCS 32
     static char arg_root[1024], prep_game_buf[1024], prep_upd_buf[1024], prep_keys_buf[1024], prep_tkeys_buf[1024];
+    static char prep_dlc_bufs[MAX_PREP_DLCS][1024];
     bool prepare = false;
     const char *prep_game = NULL, *prep_upd = NULL, *prep_keys = NULL, *prep_tkeys = NULL, *v = NULL;
+    const char *prep_dlcs[MAX_PREP_DLCS] = {0};
+    int prep_dlc_count = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (!strcmp(argv[i], "--prepare")) prepare = true;
@@ -338,6 +342,27 @@ int main(int argc, char **argv) {
             prep_game = resolve_cli_path(v, prep_game_buf, sizeof prep_game_buf);
         else if (take_flag_value(argc, argv, &i, "--update", &v))
             prep_upd = resolve_cli_path(v, prep_upd_buf, sizeof prep_upd_buf);
+        else if (!strcmp(argv[i], "--dlc") || !strncmp(argv[i], "--dlc=", 6)) {
+            if (!strcmp(argv[i], "--dlc")) {
+                if (i + 1 >= argc || !argv[i + 1][0]) {
+                    fprintf(stderr, "Missing path after --dlc.\n");
+                    return 1;
+                }
+                v = argv[++i];
+            } else {
+                v = argv[i] + 6;
+                if (!*v) {
+                    fprintf(stderr, "Missing path in --dlc=.\n");
+                    return 1;
+                }
+            }
+            if (prep_dlc_count >= MAX_PREP_DLCS) {
+                fprintf(stderr, "Too many --dlc arguments (max %d).\n", MAX_PREP_DLCS);
+                return 1;
+            }
+            const char *resolved = resolve_cli_path(v, prep_dlc_bufs[prep_dlc_count], sizeof prep_dlc_bufs[prep_dlc_count]);
+            if (resolved) prep_dlcs[prep_dlc_count++] = resolved;
+        }
         else if (take_flag_value(argc, argv, &i, "--keys", &v))
             prep_keys = resolve_cli_path(v, prep_keys_buf, sizeof prep_keys_buf);
         else if (take_flag_value(argc, argv, &i, "--title-keys", &v))
@@ -355,8 +380,9 @@ int main(int argc, char **argv) {
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (prepare) {
         extern int launcher_prepare(const char *root, const char *game_path, const char *update_path,
+                                    const char *const *dlc_paths, int dlc_count,
                                     const char *keys_path, const char *title_keys_path);
-        return launcher_prepare(root, prep_game, prep_upd, prep_keys, prep_tkeys);
+        return launcher_prepare(root, prep_game, prep_upd, prep_dlcs, prep_dlc_count, prep_keys, prep_tkeys);
     }
     {   // Pokémon Violet 4.0.0 (runtime/game_identity.h; until v0.0.24 this list was Z-A's and Arceus's builds, copied
         // over, and Violet's own wasn't in it): the start screen sets its files up from the player's packages

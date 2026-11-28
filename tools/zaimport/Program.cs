@@ -46,8 +46,25 @@ static int Fail(string why)
 static int Run(string[] args)
 {
     string? titleKeys = null;  // (--title-keys: the launcher found it by its contents, whatever its name)
-    if (args.Length >= 2 && args[0] == "--title-keys") (titleKeys, args) = (args[1], args[2..]);
-    if (args.Length < 3) return Fail("usage: zaimport [--title-keys <title.keys>] <prod.keys> <out dir> <package.xci|nsp>...");
+    bool aocOnly = false;      // (--aoc-only: incremental DLC import into <out dir>/aoc/ without base game)
+    while (args.Length > 0 && args[0].StartsWith("--"))
+    {
+        if (args[0] == "--title-keys")
+        {
+            if (args.Length < 2) return Fail("usage: zaimport [--aoc-only] [--title-keys <title.keys>] <prod.keys> <out dir> <package.xci|nsp>...");
+            (titleKeys, args) = (args[1], args[2..]);
+        }
+        else if (args[0] == "--aoc-only")
+        {
+            aocOnly = true;
+            args = args[1..];
+        }
+        else
+        {
+            return Fail($"unknown option: {args[0]}");
+        }
+    }
+    if (args.Length < 3) return Fail("usage: zaimport [--aoc-only] [--title-keys <title.keys>] <prod.keys> <out dir> <package.xci|nsp>...");
     string keyDir = Path.GetDirectoryName(Path.GetFullPath(args[0]))!;
     titleKeys ??= new[] { "title.keys", "title.keys.txt" }.Select(n => Path.Combine(keyDir, n)).FirstOrDefault(File.Exists);
     var ks = ExternalKeyReader.ReadKeyFile(args[0], titleKeys);
@@ -89,64 +106,61 @@ static int Run(string[] args)
         }
     }
 
-    Nca? base_ = null, upd = null;
-    var dlcs = new List<Nca>();
-    // The games set up from their packages (update: +0x800, DLC: +0x1000 + n); the first one found among them is taken
-    var Games = new (ulong id, string name)[] { (0x01008F6008C5E000, "Pokémon Violet"),
-                                                (0x0100A3D008C5C000, "Pokémon Scarlet"),
-                                                (0x0100F43008C44000, "Pokémon Legends Z-A"),
-                                                (0x01001F5010DFA000, "Pokémon Legends Arceus") };
-    ulong ZaBase = Games.Select(g => g.id).FirstOrDefault(id => ncas.Any(n => n.nca.Header.TitleId == id));
+    var ncaEntries = ncas.Select(x => new NcaEntry(
+        x.nca.Header.TitleId,
+        x.nca.Header.ContentType == NcaContentType.Program,
+        x.nca.Header.ContentType == NcaContentType.Program && IsPatch(x.nca),
+        x.nca.Header.ContentType == NcaContentType.PublicData)).ToList();
+
+    var cls = ZaImportLogic.Classify(ncaEntries, aocOnly);
+    if (cls.Error != null) return Fail(cls.Error);
+
     foreach (var (nca, name) in ncas)
     {
         ulong tid = nca.Header.TitleId;
-        if (ZaBase == 0 || (tid & ~0x1FFFUL) != ZaBase) continue;
-        Console.WriteLine($"{name}: title {tid:x16} {nca.Header.ContentType}");
-        if (nca.Header.ContentType == NcaContentType.Program)
-        {
-            // (the update's program NCA carries the base title id too: its data section is a patch)
-            if (IsPatch(nca)) upd = nca;
-            else if (tid == ZaBase) base_ = nca;
-        }
-        else if (nca.Header.ContentType == NcaContentType.PublicData)
-        {
-            dlcs.Add(nca);
-        }
+        if ((tid & ~0x1FFFUL) == cls.BaseTitleId)
+            Console.WriteLine($"{cls.GameName}: title {tid:x16} {nca.Header.ContentType}");
     }
-    if (base_ == null)
-        return Fail(ncas.Count == 0 ? "no game packages found" : $"the base game of {string.Join(" or ", Games.Select(g => g.name))} isn't among these files");
-    foreach (var n in new[] { base_, upd }.Concat(dlcs))
+
+    Nca? base_ = cls.BaseIndex >= 0 ? ncas[cls.BaseIndex].nca : null;
+    Nca? upd = cls.UpdateIndex >= 0 ? ncas[cls.UpdateIndex].nca : null;
+    var dlcs = cls.DlcIndices.Select(i => ncas[i].nca).ToList();
+
+    var toCheck = aocOnly ? dlcs.AsEnumerable<Nca?>() : new[] { base_, upd }.Concat(dlcs);
+    foreach (var n in toCheck)
         if (n != null && n.Header.HasRightsId && !ks.ExternalKeySet.Contains(new RightsId(n.Header.RightsId)))
             return Fail($"no title key for {n.Header.TitleId:x16}: put title.keys from your Switch in the folder with " +
                         "the game files (packages without their ticket need it)");
 
     string outDir = args[1];
-    Directory.CreateDirectory(Path.Combine(outDir, "exefs"));
-    var code = upd ?? base_;
-    using (var exefs = code.OpenFileSystem(NcaSectionType.Code, IntegrityCheckLevel.None))
+    var images = new List<(IStorage st, string path)>();
+    if (!aocOnly)
     {
-        foreach (var e in exefs.EnumerateEntries("/", "*"))
+        Directory.CreateDirectory(Path.Combine(outDir, "exefs"));
+        var code = upd ?? base_!;
+        using (var exefs = code.OpenFileSystem(NcaSectionType.Code, IntegrityCheckLevel.None))
         {
-            using var f = new UniqueRef<IFile>();
-            exefs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
-            f.Get.GetSize(out long sz).ThrowIfFailure();
-            var data = new byte[sz];
-            f.Get.Read(out _, 0, data).ThrowIfFailure();
-            File.WriteAllBytes(Path.Combine(outDir, "exefs", e.Name), data);
+            foreach (var e in exefs.EnumerateEntries("/", "*"))
+            {
+                using var f = new UniqueRef<IFile>();
+                exefs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                f.Get.GetSize(out long sz).ThrowIfFailure();
+                var data = new byte[sz];
+                f.Get.Read(out _, 0, data).ThrowIfFailure();
+                File.WriteAllBytes(Path.Combine(outDir, "exefs", e.Name), data);
+            }
         }
-    }
-    Console.WriteLine($"exefs from {(upd != null ? "the update" : "the base game")}");
+        Console.WriteLine($"exefs from {(upd != null ? "the update" : "the base game")}");
 
-    var images = new List<(IStorage st, string path)>
-    {
-        (upd != null ? base_.OpenStorageWithPatch(upd, NcaSectionType.Data, IntegrityCheckLevel.None)
-                     : base_.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.None),
-         Path.Combine(outDir, "romfs.bin"))
-    };
+        images.Add((upd != null ? base_!.OpenStorageWithPatch(upd, NcaSectionType.Data, IntegrityCheckLevel.None)
+                                : base_!.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.None),
+                    Path.Combine(outDir, "romfs.bin")));
+    }
+
     if (dlcs.Count > 0) Directory.CreateDirectory(Path.Combine(outDir, "aoc"));
     foreach (var d in dlcs)
         images.Add((d.OpenStorage(NcaSectionType.Data, IntegrityCheckLevel.None),
-                    Path.Combine(outDir, "aoc", $"{d.Header.TitleId:x16}.bin")));
+                    ZaImportLogic.ResolveAocOutputPath(outDir, d.Header.TitleId)));
     long total = 0, done = 0;
     foreach (var (st, _) in images)
     {
@@ -169,7 +183,9 @@ static int Run(string[] args)
         f.Close();
         File.Move(path + ".part", path, true);
     }
-    Console.WriteLine($"done: update {(upd != null ? "applied" : "none")}, {dlcs.Count} DLC");
+    Console.WriteLine(aocOnly
+        ? $"done: aoc-only, {dlcs.Count} DLC"
+        : $"done: update {(upd != null ? "applied" : "none")}, {dlcs.Count} DLC");
     return 0;
 }
 
