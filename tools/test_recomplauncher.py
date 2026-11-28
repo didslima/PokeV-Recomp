@@ -404,7 +404,11 @@ def test_aoc_cleanup_and_save_preservation():
 
 static int remove_tree(const char *p) {
     struct stat st;
+#ifdef _WIN32
+    if (stat(p, &st) != 0) return 1;
+#else
     if (lstat(p, &st) != 0) return 1;
+#endif
     if (!S_ISDIR(st.st_mode)) return remove(p) == 0;
     DIR *d = opendir(p);
     if (!d) return 0;
