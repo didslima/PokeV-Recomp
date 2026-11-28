@@ -1,6 +1,6 @@
-// Game identity (runtime/game_identity.h): only Pokémon Violet 4.0.0's exefs/main is accepted; Legends: Arceus, Z-A
-// and Link's Awakening are recognised by name and refused (issue #1: Arceus's extracted/ passed as PokeV's), unknown
-// builds refused. Builds fake NSO headers in a scratch folder: tools/test_game_identity.py <empty scratch dir>.
+// Game identity (runtime/game_identity.h): Pokémon Violet 4.0.0 and Pokémon Scarlet 4.0.0 exefs/main are accepted;
+// Legends: Arceus, Z-A and Link's Awakening are recognised by name and refused (issue #1: Arceus's extracted/ passed as
+// PokeV's), unknown builds refused. Builds fake NSO headers in a scratch folder: tools/test_game_identity.py <empty scratch dir>.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +13,8 @@ static int failures;
         if (!(c)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); failures++; } \
     } while (0)
 
-static const uint8_t VIOLET_301[8] = {0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64};
+static const uint8_t VIOLET_400[8] = {0x70, 0x9b, 0xfd, 0x66, 0x11, 0x52, 0x98, 0x64};
+static const uint8_t SCARLET_400[8] = {0x42, 0x1c, 0x54, 0x11, 0xb4, 0x87, 0xeb, 0x4d};
 static const uint8_t ARCEUS_111[8] = {0xae, 0xe8, 0xf1, 0x50, 0xdd, 0xa1, 0xb5, 0xa8};
 static const uint8_t ZA_100[8] = {0x72, 0x22, 0xe1, 0x3e, 0xcf, 0x6a, 0xdb, 0x32};
 static const uint8_t ZA_200[8] = {0x8a, 0x1c, 0x86, 0xc4, 0x37, 0x39, 0x4b, 0x69};
@@ -50,13 +51,23 @@ int main(int argc, char **argv) {
     char p[1100], desc[160];
     uint8_t id[8];
 
-    // Pokémon Violet 4.0.0: the one build accepted
+    // Pokémon Violet 4.0.0 and Pokémon Scarlet 4.0.0: both builds accepted, with isolated save roots
+    char save_root[128];
     snprintf(p, sizeof p, "%s/violet_main", dir);
-    put_main(p, VIOLET_301, 0x80);
+    put_main(p, VIOLET_400, 0x80);
     CHECK(game_identity_read(p, id));
     CHECK(game_identity_supported(id) && !strcmp(game_identity_supported(id), "4.0.0"));
     game_identity_describe(id, desc, sizeof desc);
     CHECK(!strcmp(desc, "Pok\xc3\xa9mon Violet 4.0.0"));
+    CHECK(!strcmp(game_identity_save_root(game_identity_find(id), save_root, sizeof save_root), "save"));
+
+    snprintf(p, sizeof p, "%s/scarlet_main", dir);
+    put_main(p, SCARLET_400, 0x80);
+    CHECK(game_identity_read(p, id));
+    CHECK(game_identity_supported(id) && !strcmp(game_identity_supported(id), "4.0.0"));
+    game_identity_describe(id, desc, sizeof desc);
+    CHECK(!strcmp(desc, "Pok\xc3\xa9mon Scarlet 4.0.0"));
+    CHECK(!strcmp(game_identity_save_root(game_identity_find(id), save_root, sizeof save_root), "save/scarlet"));
 
     // the ancestors' builds: recognised, refused by name (the start screen says whose files they are)
     refused(dir, "arceus_main", ARCEUS_111, "Pok\xc3\xa9mon Legends: Arceus 1.1.1");
@@ -69,24 +80,24 @@ int main(int argc, char **argv) {
     static const uint8_t other[8] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef};
     refused(dir, "other_main", other, "an unknown build (0123456789abcdef)");
     uint8_t near[8];  // (one bit off Violet's: matched byte for byte, not by prefix)
-    memcpy(near, VIOLET_301, 8), near[7] ^= 1;
+    memcpy(near, VIOLET_400, 8), near[7] ^= 1;
     CHECK(game_identity_supported(near) == NULL);
 
     // no file / too short to hold a build ID: not read (so never accepted)
     snprintf(p, sizeof p, "%s/missing_main", dir);
     CHECK(!game_identity_read(p, id));
     snprintf(p, sizeof p, "%s/short_main", dir);
-    put_main(p, VIOLET_301, 0x44);
+    put_main(p, VIOLET_400, 0x44);
     CHECK(!game_identity_read(p, id));
 
-    // exactly one supported entry, and it is Violet 4.0.0
+    // exactly two supported entries: Violet 4.0.0 and Scarlet 4.0.0
     int supported = 0;
     for (size_t i = 0; i < sizeof GAME_IDENTITIES / sizeof *GAME_IDENTITIES; i++)
         if (GAME_IDENTITIES[i].supported) {
             supported++;
-            CHECK(!memcmp(GAME_IDENTITIES[i].id, VIOLET_301, 8));
+            CHECK(!memcmp(GAME_IDENTITIES[i].id, VIOLET_400, 8) || !memcmp(GAME_IDENTITIES[i].id, SCARLET_400, 8));
         }
-    CHECK(supported == 1);
+    CHECK(supported == 2);
 
     if (failures) { fprintf(stderr, "%d check(s) failed\n", failures); return 1; }
     printf("all checks passed\n");

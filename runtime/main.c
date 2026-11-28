@@ -212,6 +212,13 @@ static void boot(const char *root) {
 #endif
     char why[512];
     if (!game_version_select(root, why, sizeof why)) FATAL("%s\n", why);  // (the address table: game_addresses.h)
+    {
+        extern void fs_set_save_root(const char *dir);
+        char save_root[128];
+        const GameIdentity *gid = game_identity_for_dir(root);
+        fs_set_save_root(game_identity_save_root(gid, save_root, sizeof save_root));
+        if (gid) LOG("[main] game: %s %s (save root: %s)\n", gid->game, gid->version, save_root);
+    }
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
     rando_boot();  // the chosen seed's data patches go into the freshly loaded module
