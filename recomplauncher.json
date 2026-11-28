@@ -21,6 +21,24 @@
       ]
     },
     {
+      "id": "dlc1",
+      "label": "Pokémon Violet DLC (.nsp or .xci), e.g. The Hidden Treasure of Area Zero.",
+      "role": "dlc",
+      "optional": true,
+      "formats": [
+        { "type": "file", "extensions": ["nsp", "xci"], "requires": ["keys"] }
+      ]
+    },
+    {
+      "id": "dlc2",
+      "label": "Additional Pokémon Violet DLC (.nsp or .xci), if separate.",
+      "role": "dlc",
+      "optional": true,
+      "formats": [
+        { "type": "file", "extensions": ["nsp", "xci"], "requires": ["keys"] }
+      ]
+    },
+    {
       "id": "keys",
       "label": "Nintendo Switch prod.keys",
       "role": "key",
@@ -29,7 +47,14 @@
   ],
   "prepare": {
     "program": ["PokeV-Recomp.exe", "AppRun"],
-    "args": ["--prepare", "--game={input:game}", "--update={input:update}", "--keys={input:keys}"],
+    "args": [
+      "--prepare",
+      "--game={input:game}",
+      "--update={input:update}",
+      "--dlc={input:dlc1}",
+      "--dlc={input:dlc2}",
+      "--keys={input:keys}"
+    ],
     "env": {
       "LARECOMP_DATA_ROOT": "{data}"
     },

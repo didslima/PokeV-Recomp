@@ -379,9 +379,9 @@ bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n) {
 // ---- game files
 // What the setup (runtime/ui/launcher.mm) creates in extracted/, plus what older versions' extraction and manual
 // extractions left there (never read at run time).
-static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", GAMELIB_NAME, GAMELIB_NAME ".id", ".gamebuild",
-                                         ".zigcache", ".extract", "extract.log", "xci_secure", "nso_raw", "update_pfs",
-                                         ".DS_Store"};
+static const char *const GAME_FILES[] = {"exefs", "romfs", "romfs.bin", "aoc", GAMELIB_NAME, GAMELIB_NAME ".id",
+                                         ".gamebuild", ".zigcache", ".extract", "extract.log", "xci_secure", "nso_raw",
+                                         "update_pfs", ".DS_Store"};
 
 // <data root>/extracted with links resolved (false: no data root, or it can't be resolved)
 static bool game_dir_want(char *want, size_t n) {
